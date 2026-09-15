@@ -255,12 +255,15 @@ def parse_listing_page(html: str, base_url: str) -> dict:
 
 
 def load_listing(url: str, html_text: str, back_pages: int = 3):
-    """② ブランド一覧ページ。新着順の最後の方も数ページさかのぼって最古の出品日を探す。"""
+    """② ブランド一覧ページ。新着順の最後の方も数ページさかのぼって最古の出品日を探す。
+    戻り値の最後（reached_last_page）は、実際に「最後のページ」まで確認できたかどうか。
+    出品数が非常に多い出品者では、そのページ番号がすでに存在しない（削除・変動）ことがあり、
+    その場合は False になる ―― 呼び出し側は「扱い始めた日」や「出品ペース」を鵜呑みにしない目安として使う。"""
     if html_text and html_text.strip():
         pr = parse_listing_page(html_text, "https://www.buyma.com/")
-        return pr["items"], pr["total_count"], 1, []
+        return pr["items"], pr["total_count"], 1, [], True
     if not url or not url.strip():
-        return [], None, 1, ["② のURLもHTMLも入力されていません。"]
+        return [], None, 1, ["② のURLもHTMLも入力されていません。"], False
 
     url = url.strip()
     try:
@@ -269,7 +272,7 @@ def load_listing(url: str, html_text: str, back_pages: int = 3):
         return [], None, 1, [
             f"② ページを取得できませんでした（{e}）。ページを開いて右クリック→"
             "「ページのソースを表示」→全選択コピーして、HTML貼り付け欄に入れてください。"
-        ]
+        ], False
 
     pr = parse_listing_page(first, url)
     items = list(pr["items"])
@@ -283,6 +286,7 @@ def load_listing(url: str, html_text: str, back_pages: int = 3):
             targets.append(numbered[n])
     last_page = max([*numbered.keys()], default=1)
 
+    reached_last_page = last_url is None  # 「最後」リンクが無い＝1ページで全件そろっている
     fetched = {url}
     for t in targets:
         if not t or t in fetched:
@@ -290,6 +294,8 @@ def load_listing(url: str, html_text: str, back_pages: int = 3):
         fetched.add(t)
         try:
             items.extend(parse_listing_page(fetch(t), t)["items"])
+            if t == last_url:
+                reached_last_page = True
         except Exception:  # noqa: BLE001
             pass
 
@@ -300,14 +306,15 @@ def load_listing(url: str, html_text: str, back_pages: int = 3):
             continue
         seen.add(k)
         dedup.append(it)
-    return dedup, pr["total_count"], last_page, []
+    return dedup, pr["total_count"], last_page, [], reached_last_page
 
 
-def parse_sales_page(html: str):
-    """注文実績ページから {"date": 販売日, "name": 商品名, "text": カード内の全文, "item_id": 商品ID}
-    のリストを返す。ブランド名によるしぼり込みは、name だけでなく text（カード内の見えている文字全部）
+def parse_sales_page(html: str, base_url: str = "https://www.buyma.com/"):
+    """注文実績ページから {"date": 販売日, "name": 商品名, "text": カード内の全文,
+    "item_id": 商品ID, "image": 商品画像URL, "url": 商品ページURL} のリストを返す。
+    ブランド名によるしぼり込みは、name だけでなく text（カード内の見えている文字全部）
     に対しても行う（name の取得に失敗していても text 側でブランド名を拾えることが多いため）。
-    item_id は「特定の1商品が売れたか」を確認するときに使う。"""
+    image・url は「実際に売れた商品」自体の仕入れ先探しに使う。"""
     soup = soupify(html)
     date_re = re.compile(r"20(\d{2})\s*[./年\-]\s*(\d{1,2})\s*[./月\-]\s*(\d{1,2})")
 
@@ -332,14 +339,24 @@ def parse_sales_page(html: str):
                 orders.append({
                     "date": d, "name": extract_name(card, img), "text": ctext,
                     "item_id": idm.group(1) if idm else None,
+                    "image": img_src(img) or None,
+                    "url": urljoin(base_url, a["href"]) if a else None,
                 })
 
     if not orders:  # 画像が拾えないレイアウト向けのフォールバック（商品名・IDは取得できない）
         for m in date_re.finditer(soup.get_text(" ", strip=True)):
             d = to_date(m)
             if d:
-                orders.append({"date": d, "name": "", "text": "", "item_id": None})
+                orders.append({"date": d, "name": "", "text": "", "item_id": None, "image": None, "url": None})
     return orders
+
+
+def order_matches_brand(order: dict, brand: str) -> bool:
+    """注文実績の1件が、指定したブランド名を含むか（商品名・カード内テキストの両方を見る）。"""
+    if not brand:
+        return False
+    hay = ((order.get("name") or "") + " " + (order.get("text") or "")).lower()
+    return brand.strip().lower() in hay
 
 
 def check_item_sold(seller_id: str, item_id: str, max_pages: int = 5):
@@ -401,8 +418,8 @@ def extract_country(html: str):
 
 def guess_seller_id(url: str = "", html: str = ""):
     """URLやページ内のリンクから出品者ID（数字）を推測する。
-    /buyer/12345/... 形式、/r/-B12345.../ 形式のどちらにも対応。"""
-    for pat in (r"/buyer/(\d+)/", r"-B(\d+)"):
+    /buyer/12345.html（プロフィール）、/buyer/12345/...、/r/-B12345.../ のどれにも対応。"""
+    for pat in (r"/buyer/(\d+)\.html", r"/buyer/(\d+)/", r"-B(\d+)"):
         m = re.search(pat, url or "")
         if m:
             return m.group(1)
@@ -496,10 +513,9 @@ def extract_price_generic(html: str):
 
 def extract_shipping_hint(html: str):
     """仕入れ先ページの構造化データに、送料の情報が書かれていれば拾う。
-    サイトによっては「国内配送は無料」「$100以上で無料」など複数の条件を同時に載せていることが多く、
-    どれが実際に日本への発送に適用されるかは自動では判断できない。そのため見つかった候補を
-    全部そのままリストで返す（1つに決め打ちしない）。呼び出し側は「参考情報」として提示するだけにし、
-    自動で入力欄を埋めるのには使わない。"""
+    サイトによっては「国内配送は無料」「$100以上で無料」など複数の条件を同時に載せていることが多いため、
+    見つかった候補を (金額, 通貨, 発送先の国コードまたはNone) のリストで全部返す（1つに決め打ちしない）。
+    国コードが分かれば「JP（日本）」向けの送料を優先的に案内できる。"""
     found = []
     for node in _iter_jsonld(html):
         for offer in _find_offers(node):
@@ -508,6 +524,13 @@ def extract_shipping_hint(html: str):
                 if not isinstance(one, dict):
                     continue
                 sr = one.get("shippingRate")
+                dest = one.get("shippingDestination")
+                dest_list = dest if isinstance(dest, list) else [dest] if dest else []
+                country = None
+                for d in dest_list:
+                    if isinstance(d, dict) and d.get("addressCountry"):
+                        country = str(d["addressCountry"]).upper()
+                        break
                 for r in (sr if isinstance(sr, list) else [sr] if sr else []):
                     if isinstance(r, dict) and r.get("value") is not None:
                         try:
@@ -515,10 +538,38 @@ def extract_shipping_hint(html: str):
                         except (TypeError, ValueError):
                             continue
                         if val >= 0:
-                            pair = (val, (r.get("currency") or "").upper())
+                            pair = (val, (r.get("currency") or "").upper(), country)
                             if pair not in found:
                                 found.append(pair)
     return found or None
+
+
+FREE_SHIP_PATTERNS = [
+    re.compile(
+        r"free\s+(?:standard\s+|international\s+)?(?:shipping|delivery)[^.\n]{0,40}?"
+        r"(?:over|above|on orders? over)\s*([€£$¥])\s*([\d,]+)", re.IGNORECASE,
+    ),
+    re.compile(r"([€£$¥])\s*([\d,]+)\s*(?:以上)[^.\n]{0,10}(?:送料無料|配送料無料)"),
+    re.compile(r"送料無料[^.\n]{0,15}?([€£$¥])\s*([\d,]+)\s*(?:以上)?"),
+]
+_CURRENCY_SYMBOL_MAP = {"€": "EUR", "£": "GBP", "$": "USD", "¥": "JPY"}
+
+
+def extract_free_shipping_threshold(html: str):
+    """「〇〇円以上で送料無料」のような条件をページの文章から探す（構造化データには無いことが多いため）。
+    見つかれば (金額, 通貨) を返す。サイトの言語や書き方次第で見つからないことも多い（参考情報）。"""
+    text = soupify(html).get_text(" ", strip=True)
+    for pat in FREE_SHIP_PATTERNS:
+        m = pat.search(text)
+        if m:
+            sym, amount_str = m.group(1), m.group(2)
+            try:
+                amount = float(amount_str.replace(",", ""))
+            except ValueError:
+                continue
+            if amount > 0:
+                return amount, _CURRENCY_SYMBOL_MAP.get(sym, "")
+    return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -613,6 +664,32 @@ def parse_buyma_product(html: str) -> dict:
     return result
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_photo_list(item_url: str):
+    """商品ページ本体から、その商品の写真を掲載順ですべて取得する（BUYMAの構造化データから）。
+    一覧ページのサムネイル（1枚目）は着用・スタイリングされた「見せ画像」であることが多く、
+    画像検索で仕入れ先が見つかりにくいため、2枚目以降の商品単体の写真も選べるようにする。
+    取得できなければ空リスト（呼び出し側は1枚目の画像にフォールバックする）。"""
+    try:
+        html = fetch(item_url)
+    except Exception:  # noqa: BLE001
+        return []
+    for node in _iter_jsonld(html):
+        if not isinstance(node, dict) or node.get("@type") not in ("Product", "ProductGroup"):
+            continue
+        variant = node
+        if node.get("@type") == "ProductGroup":
+            variants = node.get("hasVariant") or []
+            if variants and isinstance(variants[0], dict):
+                variant = variants[0]
+        img = variant.get("image") if isinstance(variant, dict) else None
+        photos = img if isinstance(img, list) else [img] if isinstance(img, str) else []
+        if photos:
+            return photos
+    return []
+
+
 # ============================ 小さな計算・整形 ============================
 def classify(name: str) -> str:
     low = (name or "").lower()
@@ -620,6 +697,47 @@ def classify(name: str) -> str:
         if any(k in low for k in kws):
             return cat
     return "その他"
+
+
+# カテゴリー名を英語の検索キーワードに変換する（仕入れ先探しの検索クエリ用）
+CATEGORY_EN = {
+    "バッグ": "bag",
+    "財布・小物": "wallet",
+    "靴・スニーカー": "shoes",
+    "ワンピース・ドレス": "dress",
+    "トップス": "top",
+    "アウター": "jacket",
+    "ボトムス": "pants",
+    "アクセサリー": "accessory",
+    "帽子": "hat",
+    "ベルト": "belt",
+    "マフラー・ストール・スカーフ": "scarf",
+    "サングラス・メガネ": "sunglasses",
+    "時計": "watch",
+    "キーホルダー・チャーム": "keychain",
+    "その他": "",
+}
+
+# アクセサリーは種類まで分かればより具体的な英語キーワードにする
+ACCESSORY_SUBTYPE_EN = [
+    (["ネックレス", "necklace", "pendant"], "necklace"),
+    (["ブレスレット", "bracelet"], "bracelet"),
+    (["ピアス", "イヤリング", "earring"], "earrings"),
+    (["リング", "指輪", "ring"], "ring"),
+    (["アンクレット", "anklet"], "anklet"),
+    (["ブローチ", "brooch"], "brooch"),
+]
+
+
+def category_en(name: str) -> str:
+    """商品名からカテゴリーを判定し、検索に使う英語のキーワードを返す。"""
+    cat = classify(name)
+    low = (name or "").lower()
+    if cat == "アクセサリー":
+        for kws, en in ACCESSORY_SUBTYPE_EN:
+            if any(k in low for k in kws):
+                return en
+    return CATEGORY_EN.get(cat, "")
 
 
 def clean_name(name: str) -> str:
@@ -681,8 +799,11 @@ def img_search_url(image_url: str) -> str:
 
 
 def text_search_url(brand: str, name: str) -> str:
+    """ブランド名・型番（分かれば）・カテゴリー（英語）を組み合わせた検索クエリを作る。
+    型番が取れないときは商品名の一部で代用する。ボタンを押すだけで検索できるように、
+    人が手直ししなくてもそれなりの精度になることを狙っている。"""
     model = guess_model(name)
-    q = " ".join(x for x in [brand.strip(), model or clean_name(name)[:60]] if x).strip()
+    q = " ".join(x for x in [brand.strip(), model or clean_name(name)[:60], category_en(name)] if x).strip()
     return "https://www.google.com/search?q=" + quote_plus(q)
 
 
@@ -751,6 +872,19 @@ def humanize_since(from_date: dt.date) -> str:
     return f"{humanize_duration(from_date, TODAY)}前"
 
 
+def format_pace(span_days: int, total_count: int) -> str:
+    """出品ペースを分かりやすい文字列にする。
+    1点に1日以上かかっているなら「平均X.Y日に1点」、
+    1日に複数点出品しているなら「1日に平均X.Y点」という表記にする
+    （「平均0.5日に1点」のような分かりにくい数字を避けるため）。"""
+    if span_days is None or total_count is None or span_days <= 0 or total_count <= 0:
+        return "算出不可"
+    days_per_item = span_days / total_count
+    if days_per_item >= 1:
+        return f"平均 {days_per_item:.1f} 日に1点"
+    return f"1日に平均 {total_count / span_days:.1f} 点"
+
+
 def month_key(d: dt.date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
@@ -772,7 +906,7 @@ def jp_month(key: str) -> str:
 
 WATCHLIST_COLUMNS = [
     "追加日時", "出品者名", "拠点国", "ブランド名", "出品総数",
-    "扱い始めた日", "出品ペース", "最終出品からの経過", "一覧URL", "プロフィールURL",
+    "扱い始めた日", "初めて売れた日", "出品ペース", "最終出品からの経過", "一覧URL", "プロフィールURL",
 ]
 
 
@@ -787,6 +921,46 @@ def add_to_watchlist(row: dict):
     wl.append(row)
 
 
+def render_sourcing_row(it: dict, brand: str):
+    """商品1件ぶんの「仕入れ先を探す」行を描画する（出品中の商品にも、実際に売れた商品にも使う）。"""
+    photos = fetch_photo_list(it["url"]) if it.get("url") else []
+    options = photos[1:4] if len(photos) > 1 else []  # 1枚目（見せ画像）は除く
+
+    col_img, col_info = st.columns([1, 5])
+    with col_img:
+        if it.get("image"):
+            st.image(it["image"], width=64)
+    with col_info:
+        meta = []
+        if it.get("price"):
+            meta.append(yen(it["price"]))
+        if it.get("listed_on"):
+            meta.append(f"出品 {it['listed_on']:%Y/%m/%d}")
+        if it.get("sold_on"):
+            meta.append(f"成約 {it['sold_on']:%Y/%m/%d}")
+        m = guess_model(it.get("name") or "")
+        if m:
+            meta.append(f"型番候補: {m}")
+        line = f"**{it.get('name') or '（商品名不明）'}**"
+        if meta:
+            line += "  \n" + " ／ ".join(meta)
+        st.markdown(line)
+
+    if options:
+        st.caption("👇 編集されていなさそうな写真を選んでGoogle画像検索")
+        photo_cols = st.columns(len(options))
+        for photo_col, photo_url in zip(photo_cols, options):
+            with photo_col:
+                st.image(photo_url, width=100)
+                st.link_button("この写真で検索", img_search_url(photo_url), use_container_width=True)
+    elif it.get("image"):
+        st.link_button("画像でGoogle検索", img_search_url(it["image"]), use_container_width=True)
+
+    st.link_button("型番・ブランド名・カテゴリーで検索", text_search_url(brand, it.get("name") or ""),
+                   use_container_width=True)
+    st.divider()
+
+
 # ============================ 画面：① 出品者チェック ============================
 def render_seller_tool():
     st.title("🛍️ BUYMA 出品者チェックツール")
@@ -797,25 +971,50 @@ def render_seller_tool():
     st.caption("💰 利益が出せそうかを調べたいときは「商品ごとの価格チェック」タブをお使いください。")
 
     with st.expander("使い方（クリックで開く）"):
-        st.markdown(
-            "1. 調べたい出品者のページを3つ用意します。\n"
-            "   - ① プロフィールページ（例：`https://www.buyma.com/buyer/0000000.html`）\n"
-            "   - ② その出品者のページで **対象ブランドにしぼり込み → 並び替えを「新着順」** にした一覧ページ\n"
-            "   - ③ 注文実績ページ（例：`https://www.buyma.com/buyer/0000000/sales_1.html`）\n"
-            "2. 「チェックする」を押すと、下に結果が出ます。\n\n"
-            "※ ブランド全体の競合出品者数などは、ブランドページでご自身で確認してください（このツールでは扱いません）。"
+        st.markdown("**① プロフィールのリンクを貼る**（これだけは必須）")
+        st.markdown("**② ブランドで絞った新着ページのリンクを貼る**（空欄でもOK）")
+        st.markdown("**③ 注文実績ページのリンクを貼る**（空欄でもOK・①から自動で探します）")
+        st.write("")
+        st.markdown("②が空欄のときは、その出品者の**全ブランド合計**の数字になります。")
+        st.markdown("特定のブランドだけを見たいときは、②に「ブランドで絞り込み→新着順」にしたページのリンクを貼ってください。")
+        st.write("")
+        st.markdown("貼り終わったら「チェックする」を押すだけです。")
+        st.write("")
+        st.caption("※ ブランド全体の競合出品者数は、ブランドページでご自身で確認してください（このツールでは扱いません）。")
+
+    # 履歴は、①〜③を貼り付けるフォームより上に表示する
+    # （途中でデータが消えても、URLを1から貼り直す前にまず履歴を確認できるように）
+    history = st.session_state.get("seller_history", [])
+    if history:
+        labels = [
+            f"{h['profile'].get('name') or '（出品者名不明）'}｜{h['brand_name'] or '（ブランド未入力）'}｜{h['checked_at']} 時点"
+            for h in history
+        ]
+        st.selectbox(
+            "📜 チェック履歴（このブラウザを閉じるまでの分だけ、新しい順）",
+            range(len(labels)), format_func=lambda i: labels[i], key="seller_history_select",
         )
+        st.caption("※ ブラウザを閉じたり、しばらく操作しないとこの履歴は消えます。あとで見返したい結果は「候補リストに追加」してCSVで保存してください。")
+        st.divider()
 
     with st.form("inputs"):
         c1, c2 = st.columns(2)
         with c1:
-            profile_url = st.text_input("① 出品者プロフィールページのURL",
-                                        placeholder="https://www.buyma.com/buyer/0000000.html")
-            brand_url = st.text_input("② 対象ブランドにしぼった「新着順」一覧ページのURL",
-                                      placeholder="ブランドで絞り込み→並び替えを新着順にしたページのURL")
+            profile_url = st.text_input(
+                "① 出品者プロフィールページのURL（これだけは必須）",
+                placeholder="https://www.buyma.com/buyer/0000000.html",
+            )
+            brand_url = st.text_input(
+                "② 対象ブランドにしぼった「新着順」一覧ページのURL（空欄でもOK）",
+                placeholder="空欄なら①から出品者の全商品一覧を自動で見ます（全ブランド合計になります）",
+                help="ブランドで絞り込み→並び替えを新着順にしたページのURLです。空欄の場合、その出品者の全ブランド合計の数字になります。",
+            )
         with c2:
-            sales_url = st.text_input("③ 注文実績ページのURL",
-                                      placeholder="https://www.buyma.com/buyer/0000000/sales_1.html")
+            sales_url = st.text_input(
+                "③ 注文実績ページのURL（空欄でもOK）",
+                placeholder="空欄なら①から自動で見つけます",
+                help="空欄の場合、①のプロフィールURLから自動で注文実績ページを探します。",
+            )
             brand_name = st.text_input("対象ブランド名（仕入れ先さがしの検索に使います）", placeholder="例）LOEWE")
         with st.expander("💡 URLで読み込めないとき（Community Cloud でブロックされる場合など）はHTMLを貼り付け"):
             st.caption("各ページをブラウザで開き、右クリック →「ページのソースを表示」→ 全選択してコピー → ここに貼り付け。")
@@ -825,24 +1024,72 @@ def render_seller_tool():
         go = st.form_submit_button("チェックする", type="primary", use_container_width=True)
 
     if go:
+        # ①だけでもチェックできるように、②③が空欄なら①から出品者IDを推測して自動で組み立てる
+        seller_id = guess_seller_id(profile_url.strip()) if profile_url.strip() else None
+        if not seller_id and profile_html.strip():
+            seller_id = guess_seller_id("", profile_html)
+
+        auto_brand_url = False
+        if not brand_url.strip() and not brand_html.strip() and seller_id:
+            brand_url = f"https://www.buyma.com/buyer/{seller_id}/item_1.html"
+            auto_brand_url = True
+        if not sales_url.strip() and not sales_html.strip() and seller_id:
+            sales_url = f"https://www.buyma.com/buyer/{seller_id}/sales_1.html"
+
         with st.spinner("BUYMAのページを読み込み中…（10〜30秒ほどかかることがあります）"):
-            items, total_count, last_page, e1 = load_listing(brand_url, brand_html)
+            items, total_count, last_page, e1, reached_last_page = load_listing(brand_url, brand_html)
             orders, e2 = load_sales(sales_url, sales_html)
             profile = load_profile(profile_url, profile_html)
-        st.session_state["result"] = dict(
-            items=items, total_count=total_count, last_page=last_page,
+        now = dt.datetime.now()
+        new_result = dict(
+            items=items, total_count=total_count, last_page=last_page, reached_last_page=reached_last_page,
             orders=sorted(orders, key=lambda o: o["date"]), profile=profile, brand_name=brand_name,
-            profile_url=profile_url.strip(), brand_url=brand_url.strip(),
+            profile_url=profile_url.strip(), brand_url=brand_url.strip(), auto_brand_url=auto_brand_url,
             errors=[m for m in (*e1, *e2) if m],
+            checked_at=f"{now.month}/{now.day} {now.hour:02d}:{now.minute:02d}",
         )
+        history = st.session_state.setdefault("seller_history", [])
+        history.insert(0, new_result)
+        del history[10:]  # 直近10件だけ残す（増えすぎ防止）
+        st.session_state.pop("seller_history_select", None)  # 一番新しい結果を選び直す
+        st.rerun()  # 上の履歴プルダウンに今の結果をすぐ反映させる
 
-    res = st.session_state.get("result")
-    if not res:
+    history = st.session_state.get("seller_history", [])
+    if not history:
         st.info("上のフォームに3つのURLを入れて「チェックする」を押してください。")
         return
 
+    idx = st.session_state.get("seller_history_select", 0)
+    res = history[idx]
+
     items = res["items"]
     orders = res["orders"]
+    typed_brand = (res["brand_name"] or "").strip()
+
+    # ②のURLで出品一覧はすでにブランド絞り込み済みなのに、「対象ブランド名」欄が空欄・不一致だと
+    # 注文実績（商品名でのテキスト一致）側だけ絞り込めない、というズレを防ぐ。
+    # ②が手入力されていれば、出品一覧の商品名から一番多いブランド名を推定し、それでも注文実績を絞り込む。
+    inferred_brand = None
+    if not res.get("auto_brand_url") and items:
+        guesses = Counter(guess_brand_from_name(it.get("name") or "") for it in items)
+        guesses.pop("", None)
+        if guesses:
+            inferred_brand = guesses.most_common(1)[0][0]
+
+    brand = typed_brand
+    brand_orders = [o for o in orders if typed_brand and order_matches_brand(o, typed_brand)]
+    brand_is_inferred = False
+    if not brand_orders and inferred_brand:
+        alt_orders = [o for o in orders if order_matches_brand(o, inferred_brand)]
+        if alt_orders:
+            brand_orders = alt_orders
+            brand = inferred_brand
+            brand_is_inferred = True
+
+    # ブランド名で絞り込めていればそちらを、できていなければ全件を「関係ありそうな注文」として扱う。
+    # 候補リストへの追加ボタン（1.）、仕入れ先探し（4.）の両方で使う。
+    relevant_orders = brand_orders if (brand and brand_orders) else orders
+    first_sale_date = min((o["date"] for o in relevant_orders), default=None)
 
     for msg in res["errors"]:
         st.warning(msg)
@@ -858,6 +1105,11 @@ def render_seller_tool():
         st.subheader(f"対象出品者：{res['profile']['name']}")
     if res["profile"].get("country"):
         st.caption(f"🌍 拠点国：{res['profile']['country']}")
+    if res.get("auto_brand_url"):
+        st.warning(
+            "⚠️ ②のURLが未入力だったため、この出品者の**全ブランド合計**の一覧を自動で見ています。"
+            "特定のブランドだけに絞り込みたい場合は、②にブランド絞り込み後のURLを入力してください。"
+        )
 
     dated = sorted(it["listed_on"] for it in items if it["listed_on"])
     oldest = dated[0] if dated else None
@@ -883,13 +1135,13 @@ def render_seller_tool():
     # ---------------------------------------------------------------- 1
     st.header("1. ブランドの出品状況")
 
-    if oldest and newest and total_disp:
-        span_days = (newest - oldest).days
-        pace = span_days / total_disp
-        pace_text = f"平均 {pace:.1f} 日に1点" if pace >= 0.1 else "ほぼ毎日"
+    reached_last_page = res.get("reached_last_page", True)
+    if oldest and newest and total_disp and reached_last_page:
+        pace_text = format_pace((newest - oldest).days, total_disp)
     else:
-        pace = None
-        pace_text = "算出不可"
+        pace_text = "算出不可" if reached_last_page else "算出不可（最後のページを確認できず）"
+        if not reached_last_page:
+            oldest = None
 
     since = (TODAY - newest).days if newest else None
 
@@ -899,22 +1151,8 @@ def render_seller_tool():
         ("出品ペース", pace_text),
         ("最後の出品から", humanize_since(newest) if newest else "取得できず"),
     ]
-    st.table(pd.DataFrame(status_rows, columns=["項目", "値"]).set_index("項目"))
 
-    if st.button("✅ このブランド・出品者を候補リストに追加", key="add_watchlist_seller"):
-        add_to_watchlist({
-            "追加日時": f"{TODAY.year}/{TODAY.month}/{TODAY.day}",
-            "出品者名": res["profile"].get("name") or "（不明）",
-            "拠点国": res["profile"].get("country") or "（不明）",
-            "ブランド名": res["brand_name"] or "（未入力）",
-            "出品総数": total_disp,
-            "扱い始めた日": f"{oldest.year}/{oldest.month}/{oldest.day}" if oldest else "不明",
-            "出品ペース": pace_text,
-            "最終出品からの経過": humanize_since(newest) if newest else "不明",
-            "一覧URL": res.get("brand_url") or "",
-            "プロフィールURL": res.get("profile_url") or "",
-        })
-        st.success("候補リストに追加しました。「⭐ 候補リスト」タブから確認・ダウンロードできます。")
+    st.table(pd.DataFrame(status_rows, columns=["項目", "値"]).set_index("項目"))
 
     if oldest:
         st.write(f"➡️ この出品者は、このブランドを **{humanize_duration(oldest, TODAY)}** 扱っています。")
@@ -961,23 +1199,23 @@ def render_seller_tool():
     st.header("2. 注文実績と売れ行き")
     st.caption("ログインが必要な情報（最近売れたアイテム 等）は取得しません。")
 
-    brand = (res["brand_name"] or "").strip()
-    def _order_matches(o, needle):
-        hay = ((o.get("name") or "") + " " + (o.get("text") or "")).lower()
-        return needle in hay
-
-    brand_orders = [o for o in orders if brand and _order_matches(o, brand.lower())]
-
-    if brand and brand_orders:
+    if brand_is_inferred and brand_orders:
+        use_orders = brand_orders
+        st.info(
+            f"🔎「対象ブランド名」が未入力（または注文実績に見当たらない）でしたが、②の一覧から"
+            f"**「{brand}」**と推定して注文実績を絞り込みました（{len(brand_orders)}件 / "
+            f"全ブランド合計{len(orders)}件中）。"
+        )
+    elif brand and brand_orders:
         use_orders = brand_orders
         st.info(
             f"🔎「{brand}」を含む注文にしぼり込んで表示しています（{len(brand_orders)}件 / "
             f"全ブランド合計{len(orders)}件中）。"
         )
-    elif brand and orders:
+    elif typed_brand and orders:
         use_orders = orders
         st.warning(
-            f"⚠️「{brand}」を含む注文は見つかりませんでした。**まだこのブランドが売れていない可能性**があります。"
+            f"⚠️「{typed_brand}」を含む注文は見つかりませんでした。**まだこのブランドが売れていない可能性**があります。"
             "（商品名の取得精度により、実際は売れていても見つからないことがあります）"
             "参考として、下は全ブランド合計の実績です。"
         )
@@ -1001,7 +1239,13 @@ def render_seller_tool():
         avg_per_month = total_sales / len(months)
 
         a, b, c = st.columns(3)
-        if oldest:
+        if not is_brand_specific:
+            # ブランドを絞り込めていないと、「出品開始日」と「初めて売れた日」が別々の商品のものになり、
+            # 比較しても意味のある数字にならないため、この場合は計算そのものをしない。
+            lag = None
+            a.metric("出品開始 → 初めて売れるまで", "対象外")
+            a.caption("ブランドを絞り込むと計算します（今は色々な商品の日付が混ざっているため）。")
+        elif oldest:
             lag = (first_sale - oldest).days
             a.metric("出品開始 → 初めて売れるまで", month_day_diff(oldest, first_sale) if lag >= 0 else "算出対象外")
             if lag is not None and lag >= 0:
@@ -1020,26 +1264,26 @@ def render_seller_tool():
         c.metric("月あたりの平均販売数", f"約 {avg_per_month:.1f} 件")
 
         if lag is not None and lag < 0:
-            if is_brand_specific:
-                st.caption(
-                    "※ このブランドの出品開始日より前の日付の注文が見つかったため、初回販売までの日数は計算していません"
-                    "（出品日をさかのぼりきれていない可能性があります）。"
-                )
-            else:
-                st.caption("※ この出品者はこのブランドを扱う前から他ブランドの販売実績があるため、初回販売までの日数は計算していません。")
+            st.caption(
+                "※ このブランドの出品開始日より前の日付の注文が見つかったため、初回販売までの日数は計算していません"
+                "（出品日をさかのぼりきれていない可能性があります）。"
+            )
 
-        st.markdown("**月ごとの数字（新しい月が上）**")
-        brand_label = brand if is_brand_specific else "全ブランド"
-        all_months = sorted(set(listing_months) | set(months), reverse=True)
-        month_table = pd.DataFrame({
-            "日付": [jp_month(k) for k in all_months],
-            "ブランド名": [brand_label] * len(all_months),
-            "出品数": [listing_monthly.get(k, 0) for k in all_months],
-            "販売数": [monthly.get(k, 0) for k in all_months],
-        })
-        st.table(month_table.set_index("日付"))
-        if not is_brand_specific:
-            st.caption("※ 上の「販売数」はブランドを絞り込めていないため、全ブランド合計の件数です。")
+        if is_brand_specific:
+            st.markdown("**月ごとの数字（新しい月が上）**")
+            all_months = sorted(set(listing_months) | set(months), reverse=True)
+            month_table = pd.DataFrame({
+                "日付": [jp_month(k) for k in all_months],
+                "ブランド名": [brand] * len(all_months),
+                "出品数": [listing_monthly.get(k, 0) for k in all_months],
+                "販売数": [monthly.get(k, 0) for k in all_months],
+            })
+            st.table(month_table.set_index("日付"))
+        else:
+            st.caption(
+                "💡 特定ブランドの絞り込みができていないため、この下の「よく売れているブランド」ランキングと"
+                "「上位ブランドの月間販売数」の表で、ブランドごとの内訳を確認してください。"
+            )
 
         disp = months[-24:]
         df = pd.DataFrame({"販売件数": [monthly.get(k, 0) for k in disp]},
@@ -1092,27 +1336,126 @@ def render_seller_tool():
                     )
 
     if orders:
-        with st.expander("📊 参考：直近1年のブランド別 販売ランキング（推定）"):
-            one_year_ago = TODAY - dt.timedelta(days=365)
-            recent_all = [o for o in orders if o["date"] >= one_year_ago]
-            brand_counts = Counter()
-            unknown = 0
-            for o in recent_all:
+        st.divider()
+        st.subheader("📊 この出品者の「よく売れているブランド」ランキング（推定）")
+        st.caption(
+            "出品一覧・注文実績それぞれの商品名の先頭の単語からブランドを推定して集計しています。"
+            "③のURLは入力不要です（①だけ入力していれば、自動取得した注文実績を使います）。"
+        )
+
+        listing_brand_counts = Counter()
+        for it in items:
+            b = guess_brand_from_name(it.get("name") or "")
+            if b:
+                listing_brand_counts[b] += 1
+
+        sold_brand_counts = Counter()
+        last_sold_on = {}
+        unknown = 0
+        for o in orders:
+            b = guess_brand_from_name(o.get("name") or "")
+            if b:
+                sold_brand_counts[b] += 1
+                if b not in last_sold_on or o["date"] > last_sold_on[b]:
+                    last_sold_on[b] = o["date"]
+            else:
+                unknown += 1
+
+        if not sold_brand_counts:
+            st.info("商品名を取得できた注文が少なく、ブランドごとの集計を作成できませんでした。")
+        else:
+            rank_rows = []
+            for rank, (b, total) in enumerate(sold_brand_counts.most_common(10), start=1):
+                since_sold = (TODAY - last_sold_on[b]).days
+                if since_sold <= 30:
+                    trend = "🔥 直近も売れています"
+                elif since_sold <= 90:
+                    trend = "🙂 たまに動いています"
+                else:
+                    trend = f"⚠️ 最近は売れていません（{humanize_days(since_sold)}）"
+                rank_rows.append({
+                    "順位": f"{rank}位",
+                    "ブランド（推定）": b,
+                    "出品数（確認できた範囲）": listing_brand_counts.get(b, 0),
+                    "総販売数": total,
+                    "直近の動き": trend,
+                })
+            st.dataframe(pd.DataFrame(rank_rows).set_index("順位"), use_container_width=True)
+            st.caption(
+                f"確認できた注文実績{len(orders)}件のうち、商品名からブランド名を推定できた"
+                f"{sum(sold_brand_counts.values())}件を集計しています（{unknown}件は商品名を取得できず対象外）。"
+                "商品名の先頭の単語をブランド名とみなす簡易的な推定のため、精度には限界があります。"
+                "「出品数」は取得できた出品一覧の範囲での点数（出品数が多い出品者では実際より少なく出ることがあります）、"
+                "「総販売数」は確認できた注文実績の中での件数です。"
+            )
+
+            # ランキング上位ブランドについて、月ごとの販売数も見られるように
+            bm_counts = Counter()
+            for o in orders:
                 b = guess_brand_from_name(o.get("name") or "")
                 if b:
-                    brand_counts[b] += 1
-                else:
-                    unknown += 1
-            if not brand_counts:
-                st.caption("商品名を取得できた注文が少なく、ランキングを作成できませんでした。")
-            else:
-                rank_rows = [{"ブランド（推定）": b, "販売件数": c} for b, c in brand_counts.most_common(15)]
-                st.dataframe(pd.DataFrame(rank_rows), use_container_width=True, hide_index=True)
-                st.caption(
-                    f"直近1年の注文{len(recent_all)}件のうち、商品名からブランド名を推定できた"
-                    f"{sum(brand_counts.values())}件を集計しています（{unknown}件は商品名を取得できず対象外）。"
-                    "商品名の先頭の単語をブランド名とみなす簡易的な推定のため、精度には限界があります。"
-                )
+                    bm_counts[(b, month_key(o["date"]))] += 1
+            all_dates = [o["date"] for o in orders]
+            month_list = month_span(min(all_dates), max(all_dates))[-12:]
+
+            st.markdown("**上位ブランドの月間販売数**（直近12ヶ月、新しい月が右）")
+            top_brands = [b for b, _ in sold_brand_counts.most_common(10)]
+            pivot_rows = []
+            for b in top_brands:
+                row = {"ブランド（推定）": b}
+                for mk in month_list:
+                    row[jp_month(mk)] = bm_counts.get((b, mk), 0)
+                row["合計"] = sold_brand_counts[b]
+                pivot_rows.append(row)
+            st.dataframe(
+                pd.DataFrame(pivot_rows).set_index("ブランド（推定）"),
+                use_container_width=True,
+            )
+
+    st.write("")
+    with st.container(key="watchlist_add_container"):
+        st.markdown(
+            """
+            <style>
+            .st-key-watchlist_add_container button {
+                background-color: #16305B;
+                color: #FFFFFF !important;
+                border: 1px solid #16305B;
+                border-radius: 999px;
+                padding: 0.5em 1.6em;
+                font-weight: 600;
+            }
+            .st-key-watchlist_add_container button:hover {
+                background-color: #21467F;
+                border-color: #21467F;
+                color: #FFFFFF !important;
+            }
+            .st-key-watchlist_add_container button p {
+                color: #FFFFFF !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        add_clicked = st.button("⭐ 候補リストに追加", key="add_watchlist_seller")
+    if add_clicked:
+        add_to_watchlist({
+            "追加日時": f"{TODAY.year}/{TODAY.month}/{TODAY.day}",
+            "出品者名": res["profile"].get("name") or "（不明）",
+            "拠点国": res["profile"].get("country") or "（不明）",
+            "ブランド名": brand or "（未入力）",
+            "出品総数": total_disp,
+            "扱い始めた日": f"{oldest.year}/{oldest.month}/{oldest.day}" if oldest else "不明",
+            "初めて売れた日": (
+                f"{first_sale_date.year}/{first_sale_date.month}/{first_sale_date.day}"
+                if first_sale_date else "不明（実績なし・非公開）"
+            ),
+            "出品ペース": pace_text,
+            "最終出品からの経過": humanize_since(newest) if newest else "不明",
+            "一覧URL": res.get("brand_url") or "",
+            "プロフィールURL": res.get("profile_url") or "",
+        })
+        st.success("候補リストに追加しました。「⭐ 候補リスト」タブから確認・ダウンロードできます。")
 
     # ---------------------------------------------------------------- 3
     st.divider()
@@ -1149,36 +1492,48 @@ def render_seller_tool():
     )
 
     brand = res["brand_name"] or ""
-    LIMIT = 60
+    LIMIT = 24
+
+    # 実際に売れた商品（注文実績から、item_idが分かるもののみ・重複は除く）
+    sold_items, seen_ids = [], set()
+    for o in relevant_orders:
+        if not o.get("item_id") or o["item_id"] in seen_ids or not (o.get("image") and o.get("url")):
+            continue
+        seen_ids.add(o["item_id"])
+        sold_items.append({
+            "name": o.get("name") or "（商品名不明）", "image": o["image"], "url": o["url"],
+            "price": None, "listed_on": None, "sold_on": o["date"],
+        })
+    sold_items.sort(key=lambda x: x["sold_on"], reverse=True)
+
+    if sold_items:
+        st.subheader("✅ 実際に売れた商品から探す（おすすめ）")
+        st.caption("すでに売れた実績がある商品です。仕入れ先を探す優先度が高いのはこちらです。")
+        with st.spinner("売れた商品の写真を確認しています…"):
+            for it in sold_items[:LIMIT]:
+                render_sourcing_row(it, brand)
+        if len(sold_items) > LIMIT:
+            st.caption(f"※ 売れた商品が多いため、新しい方から{LIMIT}件を表示しています。")
+        st.divider()
+    else:
+        st.info(
+            "注文実績の中から、今の出品一覧と突き合わせられる「売れた商品」が見つかりませんでした"
+            "（売り切れて出品一覧から消えている場合や、注文実績が非公開の場合があります）。"
+            "下の「出品中の商品」から探してください。"
+        )
+
+    st.subheader("📦 出品中の商品から探す")
     shown = items[:LIMIT]
     if len(items) > LIMIT:
         st.caption(f"※ 商品が多いため、新しい方から{LIMIT}件を表示しています。")
+    st.caption(
+        "💡 一覧の1枚目は着用・スタイリングされた「見せ画像」で、画像検索がヒットしにくいことがあります。"
+        "下に商品単体の写真をいくつか並べるので、編集されていなさそうな写真を選んで検索してください。"
+    )
 
-    for it in shown:
-        col_img, col_info, col_b1, col_b2 = st.columns([1, 5, 2, 2])
-        with col_img:
-            if it["image"]:
-                st.image(it["image"], width=64)
-        with col_info:
-            meta = []
-            if it["price"]:
-                meta.append(yen(it["price"]))
-            if it["listed_on"]:
-                meta.append(f"出品 {it['listed_on']:%Y/%m/%d}")
-            m = guess_model(it["name"])
-            if m:
-                meta.append(f"型番候補: {m}")
-            line = f"**{it['name']}**"
-            if meta:
-                line += "  \n" + " ／ ".join(meta)
-            st.markdown(line)
-        with col_b1:
-            if it["image"]:
-                st.link_button("画像でGoogle検索", img_search_url(it["image"]), use_container_width=True)
-        with col_b2:
-            st.link_button("型番・ブランド名で検索", text_search_url(brand, it["name"]),
-                           use_container_width=True)
-        st.divider()
+    with st.spinner("各商品の写真を確認しています…"):
+        for it in shown:
+            render_sourcing_row(it, brand)
 
     st.caption(
         "※ BUYMAのページ構造が変わると読み取り精度が落ちることがあります。その場合はHTML貼り付けをご利用ください。"
@@ -1193,37 +1548,54 @@ BULK_MAX_SELLERS = 10
 def render_bulk_tool():
     st.title("📋 複数人まとめてチェック")
     st.write("**同じブランドを扱っている出品者を、何人かまとめて比較したいときに使うツールです。**")
-    st.caption(
-        "各出品者の「ブランドにしぼった新着順一覧ページURL」（① 出品者チェックの②と同じもの）を、"
-        f"1行に1人ずつ貼ってください（最大{BULK_MAX_SELLERS}人まで）。"
-        "① 出品者チェックより情報は少なめですが、出品総数・出品ペース・直近の動き・拠点国をまとめて比較できます。"
-    )
+    with st.expander("使い方（クリックで開く）"):
+        st.markdown("**① 各出品者の「ブランドで絞った新着ページ」のリンクを、1行に1人ずつ貼る**")
+        st.markdown(f"**② 同じ並び順で「注文実績ページ」のリンクを、1行に1人ずつ貼る**（任意・最大{BULK_MAX_SELLERS}人まで）")
+        st.write("")
+        st.markdown("「🔎 出品者チェック」より情報は少なめですが、出品総数・出品ペース・売れ行き・拠点国をまとめて比較できます。")
 
     with st.form("bulk_form"):
-        brand_name_bulk = st.text_input("対象ブランド名（表示・候補リスト保存用。任意）", placeholder="例）LOEWE")
-        urls_text = st.text_area(
-            "出品者ごとの「ブランド一覧（新着順）」URL（1行に1つ）",
-            height=150,
-            placeholder=(
-                "https://www.buyma.com/buyer/1111111/item_1.html\n"
-                "https://www.buyma.com/r/-B2222222/\n"
-                "…"
-            ),
+        brand_name_bulk = st.text_input(
+            "対象ブランド名（販売件数のしぼり込み・候補リスト保存用。任意）", placeholder="例）LOEWE",
         )
+        c1, c2 = st.columns(2)
+        with c1:
+            urls_text = st.text_area(
+                "① 出品者ごとの「ブランド一覧（新着順）」URL（1行に1人）",
+                height=180,
+                placeholder=(
+                    "https://www.buyma.com/buyer/1111111/item_1.html\n"
+                    "https://www.buyma.com/r/-B2222222/\n"
+                    "…"
+                ),
+            )
+        with c2:
+            sales_urls_text = st.text_area(
+                "② 同じ順番で「注文実績」URL（1行に1人・任意）",
+                height=180,
+                placeholder=(
+                    "https://www.buyma.com/buyer/1111111/sales_1.html\n"
+                    "https://www.buyma.com/buyer/2222222/sales_1.html\n"
+                    "…"
+                ),
+                help="①と同じ順番で1行ずつ貼ってください。分からない人は空行のままでOKです（その人の販売実績は「不明」になります）。",
+            )
         go3 = st.form_submit_button("まとめてチェックする", type="primary", use_container_width=True)
 
     if go3:
         all_lines = [u.strip() for u in urls_text.splitlines() if u.strip()]
         urls = all_lines[:BULK_MAX_SELLERS]
+        sales_lines = sales_urls_text.splitlines()
         if len(all_lines) > BULK_MAX_SELLERS:
             st.warning(f"URLは最大{BULK_MAX_SELLERS}件までです。上から{BULK_MAX_SELLERS}件だけ処理します。")
 
         rows = []
         with st.spinner(f"{len(urls)}人分のページを読み込み中…（人数分、時間がかかります）"):
-            for u in urls:
-                row = {"一覧URL": u}
+            for i, u in enumerate(urls):
+                sales_url = sales_lines[i].strip() if i < len(sales_lines) else ""
+                row = {"一覧URL": u, "注文実績URL": sales_url}
                 try:
-                    items, total_count, _, errs = load_listing(u, "", back_pages=2)
+                    items, total_count, _, errs, reached_last_page = load_listing(u, "", back_pages=2)
                     if not items:
                         row["エラー"] = "商品を読み取れませんでした" + (f"（{errs[0]}）" if errs else "")
                         rows.append(row)
@@ -1233,11 +1605,13 @@ def render_bulk_tool():
                     oldest = dated[0] if dated else None
                     newest = dated[-1] if dated else None
                     total_disp = total_count or len(items)
-                    if oldest and newest and total_disp:
-                        pace = (newest - oldest).days / total_disp
-                        pace_text = f"平均{pace:.1f}日に1点" if pace >= 0.1 else "ほぼ毎日"
+                    # 「最後のページ」まで実際に確認できていない場合、一番古い出品日・出品ペースは
+                    # 実態とかけ離れた数字になるため表示しない（出品数が多い出品者ほど起きやすい）
+                    if oldest and newest and reached_last_page:
+                        pace_text = format_pace((newest - oldest).days, total_disp)
                     else:
-                        pace_text = "算出不可"
+                        pace_text = "算出不可（最後のページを確認できず）"
+                        oldest = None
                     prices = [it["price"] for it in items if it["price"]]
                     median_price = int(statistics.median(prices)) if prices else None
 
@@ -1248,14 +1622,35 @@ def render_bulk_tool():
                         prof = load_profile(profile_url, "")
                         name, country = prof.get("name"), prof.get("country")
 
+                    sales_count_text, sales_avg_text, first_sale_text = "不明", "不明", "不明"
+                    if sales_url:
+                        try:
+                            orders, _ = load_sales(sales_url, "", max_pages=3)
+                        except Exception:  # noqa: BLE001
+                            orders = []
+                        if orders:
+                            brand_orders = [o for o in orders if order_matches_brand(o, brand_name_bulk)]
+                            use_orders = brand_orders if (brand_name_bulk and brand_orders) else orders
+                            o_dates = sorted(o["date"] for o in use_orders)
+                            months = month_span(o_dates[0], o_dates[-1])
+                            sales_count_text = f"{len(use_orders)}件"
+                            sales_avg_text = f"月{len(use_orders) / len(months):.1f}件"
+                            first_sale_text = f"{o_dates[0].year}/{o_dates[0].month}/{o_dates[0].day}"
+                        else:
+                            sales_count_text, sales_avg_text = "0件", "0件"
+                            first_sale_text = "実績なし・非公開"
+
                     row.update({
                         "出品者名": name or "（不明）",
                         "拠点国": country or "（不明）",
                         "出品総数": total_disp,
                         "扱い始めた日": f"{oldest.year}/{oldest.month}/{oldest.day}" if oldest else "不明",
+                        "初めて売れた日": first_sale_text,
                         "出品ペース": pace_text,
                         "最終出品からの経過": humanize_since(newest) if newest else "不明",
                         "価格帯の中央値": yen(median_price) if median_price else "不明",
+                        "販売件数": sales_count_text,
+                        "月あたりの平均販売数": sales_avg_text,
                         "プロフィールURL": profile_url,
                     })
                 except Exception as e:  # noqa: BLE001
@@ -1266,7 +1661,7 @@ def render_bulk_tool():
 
     bres = st.session_state.get("bulk_result")
     if not bres:
-        st.info(f"上のフォームにURLを1行に1つずつ貼って（最大{BULK_MAX_SELLERS}人）「まとめてチェックする」を押してください。")
+        st.info(f"上のフォームにURLを貼って（最大{BULK_MAX_SELLERS}人）「まとめてチェックする」を押してください。")
         return
 
     rows = bres["rows"]
@@ -1274,9 +1669,13 @@ def render_bulk_tool():
     err_rows = [r for r in rows if "エラー" in r]
 
     if ok_rows:
-        cols = ["出品者名", "拠点国", "出品総数", "扱い始めた日", "出品ペース",
-                "最終出品からの経過", "価格帯の中央値", "一覧URL"]
+        cols = ["出品者名", "拠点国", "出品総数", "扱い始めた日", "初めて売れた日", "出品ペース",
+                "最終出品からの経過", "価格帯の中央値", "販売件数", "月あたりの平均販売数", "一覧URL"]
         st.dataframe(pd.DataFrame(ok_rows)[cols], use_container_width=True, hide_index=True)
+        st.caption(
+            "※「初めて売れた日」「販売件数」「月あたりの平均販売数」は②の注文実績URLを入力した人だけ表示されます"
+            "（ブランド名を入力していれば、そのブランドだけにしぼった件数・日付です）。"
+        )
         if st.button("⭐ この一覧を候補リストに追加", key="add_watchlist_bulk"):
             for r in ok_rows:
                 add_to_watchlist({
@@ -1286,6 +1685,7 @@ def render_bulk_tool():
                     "ブランド名": bres["brand_name"] or "（未入力）",
                     "出品総数": r["出品総数"],
                     "扱い始めた日": r["扱い始めた日"],
+                    "初めて売れた日": r["初めて売れた日"],
                     "出品ペース": r["出品ペース"],
                     "最終出品からの経過": r["最終出品からの経過"],
                     "一覧URL": r["一覧URL"],
@@ -1310,11 +1710,27 @@ def render_price_tool():
     st.write(
         "**「売れている商品を1つ選んで、その仕入れ先と比べたときに、ちゃんと利益が乗っているか」を確認するツールです。**"
     )
-    st.caption(
-        "① 調べたい商品のBUYMA商品ページ、② その仕入れ先（海外ショップなど）の商品ページのURLを入れると、"
-        "①の実際の販売価格を自動で取得し、②の価格をドル・ユーロ・ポンドなども含めて今のレートで円換算します。"
-        "そこに送料・経費を足して、ライバルの実際の利益率と、自分が売る場合の価格の目安を計算します。"
-    )
+    with st.expander("使い方（クリックで開く）"):
+        st.markdown("**① 調べたい商品のBUYMA商品ページのリンクを貼る**")
+        st.markdown("**② その仕入れ先（海外ショップなど）の商品ページのリンクを貼る**")
+        st.write("")
+        st.markdown("①の実際の販売価格を自動で取得します。")
+        st.markdown("②の価格は、ドル・ユーロ・ポンドなども含めて今のレートで円換算します。")
+        st.markdown("そこに送料・経費を足して、ライバルの実際の利益率と、自分が売る場合の価格の目安を計算します。")
+
+    # 履歴は、①②を貼り付けるフォームより上に表示する
+    history2 = st.session_state.get("price_history", [])
+    if history2:
+        labels2 = [
+            f"{h['product'].get('name') or '（商品名不明）'}｜{h['checked_at']} 時点"
+            for h in history2
+        ]
+        st.selectbox(
+            "📜 チェック履歴（このブラウザを閉じるまでの分だけ、新しい順）",
+            range(len(labels2)), format_func=lambda i: labels2[i], key="price_history_select",
+        )
+        st.caption("※ ブラウザを閉じたり、しばらく操作しないとこの履歴は消えます。")
+        st.divider()
 
     with st.form("price_check_form"):
         c1, c2 = st.columns(2)
@@ -1359,9 +1775,11 @@ def render_price_tool():
                     supplier_html_text = fetch(supplier_url.strip())
                 except Exception as e:  # noqa: BLE001
                     errors.append(f"②の仕入れ先ページを取得できませんでした（{e}）。仕入れ価格は下で手入力してください。")
+            free_ship_threshold = None
             if supplier_html_text:
                 supplier_price = extract_price_generic(supplier_html_text)
                 supplier_shipping = extract_shipping_hint(supplier_html_text)
+                free_ship_threshold = extract_free_shipping_threshold(supplier_html_text)
 
             sold_check = None
             if product.get("seller_id") and product.get("item_id"):
@@ -1370,15 +1788,25 @@ def render_price_tool():
                 except Exception:  # noqa: BLE001
                     sold_check = None
 
-        st.session_state["price_result"] = dict(
+        now = dt.datetime.now()
+        new_pres = dict(
             product=product, supplier_price=supplier_price, supplier_shipping=supplier_shipping,
-            sold_check=sold_check, errors=errors,
+            free_ship_threshold=free_ship_threshold, sold_check=sold_check, errors=errors,
+            checked_at=f"{now.month}/{now.day} {now.hour:02d}:{now.minute:02d}",
         )
+        history2 = st.session_state.setdefault("price_history", [])
+        history2.insert(0, new_pres)
+        del history2[10:]
+        st.session_state.pop("price_history_select", None)
+        st.rerun()  # 上の履歴プルダウンに今の結果をすぐ反映させる
 
-    pres = st.session_state.get("price_result")
-    if not pres:
+    history2 = st.session_state.get("price_history", [])
+    if not history2:
         st.info("上のフォームに2つのURLを入れて「価格をチェックする」を押してください。")
         return
+
+    idx2 = st.session_state.get("price_history_select", 0)
+    pres = history2[idx2]
 
     for e in pres["errors"]:
         st.warning(e)
@@ -1454,22 +1882,41 @@ def render_price_tool():
         st.caption("仕入れ先ページから価格を自動検出できませんでした（サイトによっては取得できません）。下に実際の仕入れ価格を入力してください。")
 
     # ---- ② 海外送料：見つかった場合も「参考情報」として見せるだけで、自動入力はしない ----
-    # サイトによっては「国内は無料」「$100以上で無料」など、条件付きの送料が複数載っていることが多く、
-    # 日本への発送に実際に適用される金額かどうかは自動では判断できないため。
-    if pres["supplier_shipping"]:
-        parts = []
-        for ship_amount, ship_currency in pres["supplier_shipping"][:4]:
-            fx2 = fetch_fx_rate(ship_currency) if ship_currency else (1.0, None)
-            if fx2:
-                parts.append(f"{ship_amount:,.2f} {ship_currency or ''}（約{yen(ship_amount * fx2[0])}）")
-            else:
-                parts.append(f"{ship_amount:,.2f} {ship_currency or ''}")
+    # サイトによっては複数の発送先ごとに送料を分けて載せていることがあり、そのときは国コードから
+    # 「日本(JP)向け」を優先して案内する。日本向けが見当たらない場合は、他の発送先の送料だけを参考に見せる。
+    def _fmt_ship(v, c):
+        fx2 = fetch_fx_rate(c) if c else (1.0, None)
+        return f"{v:,.2f} {c or ''}（約{yen(v * fx2[0])}）" if fx2 else f"{v:,.2f} {c or ''}"
+
+    shipping = pres.get("supplier_shipping")
+    if shipping:
+        jp_rates = [s for s in shipping if s[2] in ("JP", "JAPAN")]
+        other_rates = [s for s in shipping if s[2] not in ("JP", "JAPAN")]
+        if jp_rates:
+            parts = [_fmt_ship(v, c) for v, c, _ in jp_rates[:3]]
+            st.info("🔎 日本への送料として見つかった金額：" + " ／ ".join(parts))
+        else:
+            parts = [
+                f"{_fmt_ship(v, c)}{f'（{d}向け）' if d else ''}" for v, c, d in other_rates[:3]
+            ]
+            st.warning(
+                "⚠️ **日本への配送情報が見つかりません。** ページに載っていたのは次の送料でした："
+                + " ／ ".join(parts)
+                + "\n\nこのショップが日本へ発送しているか、サイトでご確認ください。"
+            )
         st.caption(
-            "🔎 仕入れ先ページに載っていた送料の候補：" + " ／ ".join(parts) + "\n\n"
-            "⚠️ 「国内配送のみ無料」「〇〇円以上で無料」など条件付きのことが多く、"
-            "日本への発送に実際にいくらかかるかはこの情報だけでは分かりません。"
-            "お手数ですが、仕入れ先のサイトで実際の国際配送料をご自身でご確認のうえ、下に入力してください。"
+            "※ 「国内配送のみ無料」など条件付きのことも多く、自動検出はあくまで参考です。"
+            "実際の国際配送料は仕入れ先のサイトでご確認のうえ、下に入力してください。"
         )
+    else:
+        st.caption("仕入れ先ページから送料の情報は見つけられませんでした。サイトでご確認のうえ、下に入力してください。")
+
+    free_ship = pres.get("free_ship_threshold")
+    if free_ship:
+        fs_amount, fs_currency = free_ship
+        fx3 = fetch_fx_rate(fs_currency) if fs_currency else (1.0, None)
+        yen_text = f"（約{yen(fs_amount * fx3[0])}）" if fx3 else ""
+        st.caption(f"💡 「{fs_amount:,.2f} {fs_currency or ''}{yen_text} 以上で送料無料」という記載がページ内に見つかりました。")
 
     st.markdown("**原価の内訳（自動入力された金額は書き換えできます）**")
     c1, c2, c3 = st.columns(3)
@@ -1522,7 +1969,7 @@ def render_price_tool():
 
     st.markdown("**② 同じ原価で自分が売るなら、いくらにすればいいか**")
     st.caption("同じ仕入れ価格・送料・経費だった場合に、目標の利益率ごとに必要な販売価格の目安です。")
-    target_rates = [0.15, 0.20, 0.25, 0.30]
+    target_rates = [r / 100 for r in range(15, 71, 5)]  # 15%〜70%まで5%刻み
     target_rows = []
     for r in target_rates:
         denom = 1 - FEE_RATE - r
@@ -1544,10 +1991,8 @@ def render_price_tool():
 def render_watchlist_tool():
     st.title("⭐ 候補リスト")
     st.write("**「🔎 出品者チェック」や「📋 複数人まとめてチェック」で気になった出品者を保存しておく場所です。**")
-    st.caption(
-        "このリストはブラウザを閉じると消えます。あとで見返したいときは、CSVでダウンロードして"
-        "Googleスプレッドシートやエクセルに保存してください。"
-    )
+    st.caption("このリストはブラウザを閉じると消えます。")
+    st.caption("あとで見返したいときは、CSVでダウンロードしてGoogleスプレッドシートやエクセルに保存してください。")
 
     wl = st.session_state.get("watchlist") or []
     if not wl:
