@@ -13,7 +13,7 @@ import re
 import statistics
 import datetime as dt
 from collections import Counter
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin, quote_plus
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin, quote_plus, quote
 
 import pandas as pd
 import requests
@@ -21,6 +21,83 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="BUYMA 出品者チェックツール", page_icon="🛍️", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: linear-gradient(160deg, #FFF8F5 0%, #FDEDE8 45%, #F7E6F0 100%);
+    }
+    h1 {
+        background: linear-gradient(90deg, #B98AC9, #F2795C);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        font-weight: 800;
+    }
+    h2, h3 {
+        color: #8B5FA3 !important;
+        font-weight: 700;
+    }
+    h2 {
+        border-bottom: 3px solid #F2A98C;
+        padding-bottom: 0.3em;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px;
+        background-color: #FCE7E2;
+        padding: 6px;
+        border-radius: 999px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 999px;
+        padding: 8px 20px;
+        color: #8B5FA3;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(90deg, #F2A98C, #F2795C);
+        color: #FFFFFF !important;
+    }
+    .stTabs [aria-selected="true"] p {
+        color: #FFFFFF !important;
+    }
+    .stButton > button, .stDownloadButton > button {
+        border-radius: 999px;
+        border: none;
+        background: linear-gradient(90deg, #F2A98C, #F2795C);
+        color: #FFFFFF;
+        font-weight: 600;
+        padding: 0.5em 1.6em;
+        transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(242, 121, 92, 0.35);
+        color: #FFFFFF;
+    }
+    .stButton > button p, .stDownloadButton > button p {
+        color: #FFFFFF !important;
+    }
+    [data-testid="stCaptionContainer"] {
+        opacity: 0.85 !important;
+    }
+    input::placeholder, textarea::placeholder {
+        color: #8A6B63 !important;
+        opacity: 1 !important;
+    }
+    [data-testid="stDataFrame"] canvas[style*="position: absolute"] {
+        filter: brightness(0.8) contrast(1.5);
+    }
+    [data-testid="stForm"], [data-testid="stExpander"] {
+        border: 1.5px solid #F0A98C !important;
+        border-radius: 14px !important;
+        background-color: rgba(255, 255, 255, 0.4) !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 TODAY = dt.date.today()
 FEE_RATE = 0.077  # BUYMA 手数料 7.7%
@@ -65,7 +142,7 @@ CATEGORY_KEYWORDS = [
 ]
 
 NOISE_RE = re.compile(
-    r"(送料無料|国内発送|国内即発|即発送|即納|正規品|新作|人気|話題|大人気|限定|セール|SALE|"
+    r"(送料無料|国内発送|国内即発|即発送|即納|すぐ届く|在庫あり|正規品|新作|人気|話題|大人気|限定|セール|SALE|"
     r"最終|訳あり|関税込み?|直営店|買付|VIP|ラッピング無料|返品可|新品|未使用)",
     re.IGNORECASE,
 )
@@ -778,6 +855,11 @@ def guess_brand_from_name(name: str) -> str:
     return brand
 
 
+def brand_group_key(brand: str) -> str:
+    """「Custype」と「CUSTYPE」のような大文字・小文字の表記ゆれを1つにまとめて集計するためのキー。"""
+    return re.sub(r"\s+", " ", brand.strip()).upper()
+
+
 def guess_model(name: str) -> str:
     """商品名から型番っぽい文字列を推測（取れないことも多い）。"""
     picks = []
@@ -796,6 +878,16 @@ def guess_model(name: str) -> str:
 
 def img_search_url(image_url: str) -> str:
     return "https://lens.google.com/uploadbyurl?url=" + quote_plus(image_url)
+
+
+def buyma_brand_search_url(brand: str) -> str:
+    """BUYMA自体のサイト内検索で、そのブランド名の商品一覧を開くリンクを作る。
+    ブランドごとの正式な「ブランドページ」のURLはBUYMA内部のコード（カタカナ表記込み）が
+    分からないと組み立てられないため、代わりにBUYMAのキーワード検索結果（該当ブランドの
+    出品が並ぶページ）にリンクする。BUYMAの検索は `/r/?kw=` ではなく `/r/{キーワード}/` という
+    パス形式でないと絞り込みが効かない（`?kw=` は無視され全商品ページが表示されてしまう）ため注意。
+    スペースは `+` ではなく `%20` でエンコードする必要がある。"""
+    return "https://www.buyma.com/r/" + quote(brand.strip(), safe="") + "/"
 
 
 def text_search_url(brand: str, name: str) -> str:
@@ -905,7 +997,7 @@ def jp_month(key: str) -> str:
 
 
 WATCHLIST_COLUMNS = [
-    "追加日時", "出品者名", "拠点国", "ブランド名", "出品総数",
+    "追加日時", "出品者名", "拠点国", "ブランド名", "ブランドページURL", "出品総数",
     "扱い始めた日", "初めて売れた日", "出品ペース", "最終出品からの経過", "一覧URL", "プロフィールURL",
 ]
 
@@ -1343,21 +1435,26 @@ def render_seller_tool():
             "③のURLは入力不要です（①だけ入力していれば、自動取得した注文実績を使います）。"
         )
 
+        # 大文字・小文字の表記ゆれ（Custype / CUSTYPE など）を1つのブランドとして数えるため、
+        # 集計は正規化したキーで行い、表示には最初に見つかった表記をそのまま使う。
         listing_brand_counts = Counter()
         for it in items:
             b = guess_brand_from_name(it.get("name") or "")
             if b:
-                listing_brand_counts[b] += 1
+                listing_brand_counts[brand_group_key(b)] += 1
 
         sold_brand_counts = Counter()
+        brand_display = {}
         last_sold_on = {}
         unknown = 0
         for o in orders:
             b = guess_brand_from_name(o.get("name") or "")
             if b:
-                sold_brand_counts[b] += 1
-                if b not in last_sold_on or o["date"] > last_sold_on[b]:
-                    last_sold_on[b] = o["date"]
+                key = brand_group_key(b)
+                sold_brand_counts[key] += 1
+                brand_display.setdefault(key, b)
+                if key not in last_sold_on or o["date"] > last_sold_on[key]:
+                    last_sold_on[key] = o["date"]
             else:
                 unknown += 1
 
@@ -1365,8 +1462,9 @@ def render_seller_tool():
             st.info("商品名を取得できた注文が少なく、ブランドごとの集計を作成できませんでした。")
         else:
             rank_rows = []
-            for rank, (b, total) in enumerate(sold_brand_counts.most_common(10), start=1):
-                since_sold = (TODAY - last_sold_on[b]).days
+            for rank, (key, total) in enumerate(sold_brand_counts.most_common(10), start=1):
+                b = brand_display[key]
+                since_sold = (TODAY - last_sold_on[key]).days
                 if since_sold <= 30:
                     trend = "🔥 直近も売れています"
                 elif since_sold <= 90:
@@ -1376,15 +1474,24 @@ def render_seller_tool():
                 rank_rows.append({
                     "順位": f"{rank}位",
                     "ブランド（推定）": b,
-                    "出品数（確認できた範囲）": listing_brand_counts.get(b, 0),
+                    "ブランドページ": buyma_brand_search_url(b),
+                    "出品数（確認できた範囲）": listing_brand_counts.get(key, 0),
                     "総販売数": total,
                     "直近の動き": trend,
                 })
-            st.dataframe(pd.DataFrame(rank_rows).set_index("順位"), use_container_width=True)
+            st.dataframe(
+                pd.DataFrame(rank_rows).set_index("順位"),
+                use_container_width=True,
+                column_config={
+                    "ブランドページ": st.column_config.LinkColumn("ブランドページ", display_text="🔗 開く"),
+                },
+            )
             st.caption(
                 f"確認できた注文実績{len(orders)}件のうち、商品名からブランド名を推定できた"
                 f"{sum(sold_brand_counts.values())}件を集計しています（{unknown}件は商品名を取得できず対象外）。"
                 "商品名の先頭の単語をブランド名とみなす簡易的な推定のため、精度には限界があります。"
+                "「ブランドページ」はBUYMA内のキーワード検索結果を開くリンクのため、"
+                "うまくブランド名を推定できていない行では関係のないページが開くことがあります。"
                 "「出品数」は取得できた出品一覧の範囲での点数（出品数が多い出品者では実際より少なく出ることがあります）、"
                 "「総販売数」は確認できた注文実績の中での件数です。"
             )
@@ -1394,18 +1501,18 @@ def render_seller_tool():
             for o in orders:
                 b = guess_brand_from_name(o.get("name") or "")
                 if b:
-                    bm_counts[(b, month_key(o["date"]))] += 1
+                    bm_counts[(brand_group_key(b), month_key(o["date"]))] += 1
             all_dates = [o["date"] for o in orders]
             month_list = month_span(min(all_dates), max(all_dates))[-12:]
 
             st.markdown("**上位ブランドの月間販売数**（直近12ヶ月、新しい月が右）")
-            top_brands = [b for b, _ in sold_brand_counts.most_common(10)]
+            top_keys = [key for key, _ in sold_brand_counts.most_common(10)]
             pivot_rows = []
-            for b in top_brands:
-                row = {"ブランド（推定）": b}
+            for key in top_keys:
+                row = {"ブランド（推定）": brand_display[key]}
                 for mk in month_list:
-                    row[jp_month(mk)] = bm_counts.get((b, mk), 0)
-                row["合計"] = sold_brand_counts[b]
+                    row[jp_month(mk)] = bm_counts.get((key, mk), 0)
+                row["合計"] = sold_brand_counts[key]
                 pivot_rows.append(row)
             st.dataframe(
                 pd.DataFrame(pivot_rows).set_index("ブランド（推定）"),
@@ -1418,16 +1525,16 @@ def render_seller_tool():
             """
             <style>
             .st-key-watchlist_add_container button {
-                background-color: #16305B;
+                background-color: #8B5FA3;
                 color: #FFFFFF !important;
-                border: 1px solid #16305B;
+                border: 1px solid #8B5FA3;
                 border-radius: 999px;
                 padding: 0.5em 1.6em;
                 font-weight: 600;
             }
             .st-key-watchlist_add_container button:hover {
-                background-color: #21467F;
-                border-color: #21467F;
+                background-color: #714B87;
+                border-color: #714B87;
                 color: #FFFFFF !important;
             }
             .st-key-watchlist_add_container button p {
@@ -1444,6 +1551,7 @@ def render_seller_tool():
             "出品者名": res["profile"].get("name") or "（不明）",
             "拠点国": res["profile"].get("country") or "（不明）",
             "ブランド名": brand or "（未入力）",
+            "ブランドページURL": buyma_brand_search_url(brand) if brand else "",
             "出品総数": total_disp,
             "扱い始めた日": f"{oldest.year}/{oldest.month}/{oldest.day}" if oldest else "不明",
             "初めて売れた日": (
@@ -1455,7 +1563,7 @@ def render_seller_tool():
             "一覧URL": res.get("brand_url") or "",
             "プロフィールURL": res.get("profile_url") or "",
         })
-        st.success("候補リストに追加しました。「⭐ 候補リスト」タブから確認・ダウンロードできます。")
+        st.success("候補リストに追加しました。「📒 ブランド候補リスト」タブから確認・ダウンロードできます。")
 
     # ---------------------------------------------------------------- 3
     st.divider()
@@ -1683,6 +1791,7 @@ def render_bulk_tool():
                     "出品者名": r["出品者名"],
                     "拠点国": r["拠点国"],
                     "ブランド名": bres["brand_name"] or "（未入力）",
+                    "ブランドページURL": buyma_brand_search_url(bres["brand_name"]) if bres["brand_name"] else "",
                     "出品総数": r["出品総数"],
                     "扱い始めた日": r["扱い始めた日"],
                     "初めて売れた日": r["初めて売れた日"],
@@ -1691,7 +1800,7 @@ def render_bulk_tool():
                     "一覧URL": r["一覧URL"],
                     "プロフィールURL": r["プロフィールURL"],
                 })
-            st.success(f"{len(ok_rows)}件を候補リストに追加しました。「⭐ 候補リスト」タブから確認できます。")
+            st.success(f"{len(ok_rows)}件を候補リストに追加しました。「📒 ブランド候補リスト」タブから確認できます。")
     else:
         st.info("読み取れた出品者がいませんでした。")
 
@@ -1989,7 +2098,7 @@ def render_price_tool():
 
 # ============================ 画面：④ 候補リスト ============================
 def render_watchlist_tool():
-    st.title("⭐ 候補リスト")
+    st.title("📒 ブランド候補リスト")
     st.write("**「🔎 出品者チェック」や「📋 複数人まとめてチェック」で気になった出品者を保存しておく場所です。**")
     st.caption("このリストはブラウザを閉じると消えます。")
     st.caption("あとで見返したいときは、CSVでダウンロードしてGoogleスプレッドシートやエクセルに保存してください。")
@@ -2003,7 +2112,14 @@ def render_watchlist_tool():
         return
 
     df = pd.DataFrame(wl)[WATCHLIST_COLUMNS]
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df, use_container_width=True, hide_index=True,
+        column_config={
+            "ブランドページURL": st.column_config.LinkColumn("ブランドページ", display_text="🔗 開く"),
+            "一覧URL": st.column_config.LinkColumn("一覧URL", display_text="🔗 開く"),
+            "プロフィールURL": st.column_config.LinkColumn("プロフィールURL", display_text="🔗 開く"),
+        },
+    )
     st.caption(f"現在 {len(wl)} 件保存されています。")
 
     c1, c2 = st.columns(2)
@@ -2023,7 +2139,7 @@ def render_watchlist_tool():
 # ============================ エントリーポイント ============================
 def main():
     tab1, tab2, tab3, tab4 = st.tabs([
-        "🔎 出品者チェック", "📋 複数人まとめてチェック", "💰 商品ごとの価格チェック", "⭐ 候補リスト",
+        "🔎 出品者チェック", "📋 複数人まとめてチェック", "💰 商品ごとの価格チェック", "📒 ブランド候補リスト",
     ])
     with tab1:
         render_seller_tool()
