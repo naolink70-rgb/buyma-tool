@@ -1,0 +1,10 @@
+[theme]
+base = "light"
+primaryColor = "#F2795C"
+backgroundColor = "#FFF8F5"
+secondaryBackgroundColor = "#FCE7E2"
+textColor = "#4A3B36"
+dataframeHeaderBackgroundColor = "#F6C9B7"
+
+[browser]
+gatherUsageStats = false
