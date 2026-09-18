@@ -829,13 +829,44 @@ _BRAND_STOPWORDS = {
     "GIRL'S", "BOY'S", "NEW", "SALE",
 }
 
+_KNOWN_BRANDS = [
+    "LOUIS VUITTON", "SAINT LAURENT", "BOTTEGA VENETA", "THE NORTH FACE",
+    "STONE ISLAND", "CHRISTIAN DIOR", "CHANEL", "HERMES", "HERMÈS", "GUCCI",
+    "PRADA", "DIOR", "FENDI", "CELINE", "CÉLINE", "BALENCIAGA", "BURBERRY",
+    "MIU MIU", "VALENTINO", "GIVENCHY", "GOYARD", "MONCLER", "LOEWE",
+    "COACH", "TORY BURCH", "MICHAEL KORS", "KATE SPADE", "MARC JACOBS",
+    "ALEXANDER MCQUEEN", "OFF-WHITE", "AMI PARIS", "JIL SANDER",
+    "MACKAGE", "STUSSY", "ADIDAS", "NIKE", "NEW BALANCE", "UGG",
+    "STEVE MADDEN", "VERSACE", "GIORGIO ARMANI", "ARMANI",
+    "SALVATORE FERRAGAMO", "FERRAGAMO", "TOD'S", "JIMMY CHOO",
+    "MANOLO BLAHNIK", "ROGER VIVIER", "CARTIER", "TIFFANY & CO", "TIFFANY",
+    "BVLGARI", "MONTBLANC", "ROLEX", "PATEK PHILIPPE", "MAISON MARGIELA",
+    "COMME DES GARCONS", "ISSEY MIYAKE", "YOHJI YAMAMOTO", "KENZO",
+    "LANVIN", "THOM BROWNE", "RICK OWENS", "VETEMENTS", "BALMAIN",
+    "CHLOE", "CHLOÉ", "MULBERRY", "LONGCHAMP", "FURLA", "FEILER",
+    "PATAGONIA", "CANADA GOOSE", "BARBOUR", "PURPLE BRAND",
+]
+
+
+def _find_known_brand(text_upper: str) -> str:
+    for b in _KNOWN_BRANDS:
+        pattern = r"(?<![A-Za-z])" + re.escape(b) + r"(?![A-Za-z])"
+        if re.search(pattern, text_upper):
+            return b
+    return ""
+
 
 def guess_brand_from_name(name: str) -> str:
-    """商品名の先頭の単語（1〜2語）からブランド名を推定する簡易ロジック。
-    正式なブランド辞書は使っていないため、精度には限界がある（あくまで参考値）。"""
+    """商品名からブランド名を推定する。まず主要ブランドの辞書で商品名全体を検索し、
+    見つかればそれを使う（キャッチコピーがブランド名の前に付いていても拾える）。
+    辞書に無いブランドは、商品名の先頭の単語（1〜2語）を仮のブランド名として使う
+    簡易ロジックにフォールバックする（あくまで参考値、精度には限界がある）。"""
     n = clean_name(name)
     if not n:
         return ""
+    known = _find_known_brand(n.upper())
+    if known:
+        return known
     tokens = [t for t in n.split(" ") if t]
     if not tokens:
         return ""
