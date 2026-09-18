@@ -826,7 +826,7 @@ def clean_name(name: str) -> str:
 
 _BRAND_STOPWORDS = {
     "MEN'S", "WOMEN'S", "MENS", "WOMENS", "KIDS", "UNISEX",
-    "GIRL'S", "BOY'S", "NEW", "SALE",
+    "GIRL'S", "BOY'S", "NEW", "SALE", "BUYMA",
 }
 
 _KNOWN_BRANDS = [
@@ -856,11 +856,47 @@ def _find_known_brand(text_upper: str) -> str:
     return ""
 
 
+_LATIN_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9&.'\-]*$")
+_KATAKANA_TOKEN_RE = re.compile(r"^[ァ-ヴー]+$")
+_KATAKANA_STOPWORDS = {
+    "スタイル", "デザイン", "サイズ", "カラー", "タイプ", "モデル", "シリーズ",
+    "アイテム", "コレクション", "セット", "ポイント", "ランキング", "ブランド",
+    "スタッフ", "ページ", "レディース", "メンズ", "キッズ",
+    # 商品カテゴリー・素材など、ブランド名ではない一般的な単語
+    "バッグ", "シューズ", "ワンピース", "パンツ", "スカート", "ジャケット",
+    "コート", "ニット", "セーター", "スニーカー", "サンダル", "ブーツ",
+    "パーカー", "ネックレス", "ピアス", "イヤリング", "リング", "ブレスレット",
+    "ベルト", "マフラー", "ストール", "キャップ", "ハット", "グローブ",
+    "ソックス", "タイツ", "レギンス", "カーディガン", "ブラウス", "シャツ",
+    "デニム", "ジーンズ", "スウェット", "フーディー", "ダウン", "レザー",
+    "ウール", "コットン", "シルク", "カシミヤ",
+    # セール・宣伝でよく出てくる単語
+    "セール", "クーポン", "キャンペーン", "プレゼント", "ギフト", "スペシャル",
+    "リミテッド", "シーズン", "トレンド", "サマー", "ウィンター",
+}
+
+
+def _looks_brand_like(tok: str, *, allow_katakana: bool = True) -> bool:
+    """トークンが「ブランド名っぽいか」を判定する。日本語の宣伝文句（関税・国内発・
+    入手困難など）は通常、漢字・ひらがな主体でアルファベットもカタカナ単独でもないため、
+    これらを除外することでブランド名らしい単語だけを拾う狙い。"""
+    if not tok or tok.upper() in _BRAND_STOPWORDS:
+        return False
+    if any(c.isdigit() for c in tok):
+        return False
+    if _LATIN_TOKEN_RE.fullmatch(tok):
+        return True
+    if allow_katakana and _KATAKANA_TOKEN_RE.fullmatch(tok) and tok not in _KATAKANA_STOPWORDS:
+        return True
+    return False
+
+
 def guess_brand_from_name(name: str) -> str:
     """商品名からブランド名を推定する。まず主要ブランドの辞書で商品名全体を検索し、
     見つかればそれを使う（キャッチコピーがブランド名の前に付いていても拾える）。
-    辞書に無いブランドは、商品名の先頭の単語（1〜2語）を仮のブランド名として使う
-    簡易ロジックにフォールバックする（あくまで参考値、精度には限界がある）。"""
+    辞書に無いブランドは、商品名の先頭付近から「ブランド名っぽい」（英字またはカタカナの）
+    単語を探して使う簡易ロジックにフォールバックする（あくまで参考値、精度には限界がある）。
+    ブランド名っぽい単語が見つからない場合は空文字を返し、集計対象から除外する。"""
     n = clean_name(name)
     if not n:
         return ""
@@ -870,16 +906,21 @@ def guess_brand_from_name(name: str) -> str:
     tokens = [t for t in n.split(" ") if t]
     if not tokens:
         return ""
-    picked = [tokens[0]]
+    start = None
+    for i, tok in enumerate(tokens[:6]):
+        if _looks_brand_like(tok):
+            start = i
+            break
+    if start is None:
+        return ""
+    picked = [tokens[start]]
+    nxt = start + 1
     if (
-        len(tokens) >= 2
-        and tokens[1].upper() not in _BRAND_STOPWORDS
-        and not any(c.isdigit() for c in tokens[1])
-        and "-" not in tokens[1]
-        and (tokens[1].isupper() or tokens[1][:1].isupper())
-        and len(tokens[1]) <= 12
+        nxt < len(tokens)
+        and len(tokens[nxt]) <= 12
+        and _looks_brand_like(tokens[nxt], allow_katakana=False)
     ):
-        picked.append(tokens[1])
+        picked.append(tokens[nxt])
     brand = " ".join(picked)
     if len(brand) < 2 or brand.isdigit():
         return ""
