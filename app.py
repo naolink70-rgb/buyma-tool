@@ -94,6 +94,20 @@ st.markdown(
         border-radius: 14px !important;
         background-color: rgba(255, 255, 255, 0.4) !important;
     }
+    /* セレクトボックス・数値入力は、初期状態だと枠線の色が背景色と同じで見分けづらいため、
+       はっきりした枠線と白背景を付けて他の背景から浮き立たせる。 */
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div,
+    [data-testid="stNumberInputContainer"] {
+        background-color: #FFFFFF !important;
+        border: 1.5px solid #F2795C !important;
+        border-radius: 8px !important;
+    }
+    [data-testid="stRadio"] {
+        background-color: rgba(255, 255, 255, 0.5) !important;
+        border: 1.5px solid #F0A98C !important;
+        border-radius: 10px !important;
+        padding: 0.6em 0.8em !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -386,6 +400,16 @@ def load_listing(url: str, html_text: str, back_pages: int = 3):
     return dedup, pr["total_count"], last_page, [], reached_last_page
 
 
+_FEE_ITEM_RE = re.compile(r"(代|料|費)$")
+
+
+def _is_fee_only_item(name: str) -> bool:
+    """「レターパック代」「送料」のような、実商品ではなく送料・手数料を徴収するためだけの
+    出品が、注文実績の集計に実商品として紛れ込むのを防ぐ。短く「〜代/料/費」で終わる名前を対象とする。"""
+    n = (name or "").strip()
+    return bool(n) and len(n) <= 15 and bool(_FEE_ITEM_RE.search(n))
+
+
 def parse_sales_page(html: str, base_url: str = "https://www.buyma.com/"):
     """注文実績ページから {"date": 販売日, "name": 商品名, "text": カード内の全文,
     "item_id": 商品ID, "image": 商品画像URL, "url": 商品ページURL} のリストを返す。
@@ -410,7 +434,7 @@ def parse_sales_page(html: str, base_url: str = "https://www.buyma.com/"):
         m = date_re.search(ctext)
         if m:
             d = to_date(m)
-            if d:
+            if d and not _is_fee_only_item(extract_name(card, img)):
                 a = card.find("a", href=True)
                 idm = re.search(r"/item/(\d+)/", a["href"]) if a else None
                 orders.append({
@@ -458,17 +482,25 @@ def check_item_sold(seller_id: str, item_id: str, max_pages: int = 5):
     return {"found": False, "date": None, "checked_pages": checked_pages}
 
 
-def load_sales(url: str, html_text: str, max_pages: int = 12):
-    """③ 注文実績ページ。sales_1.html → sales_2.html … と自動でめくる。"""
+def load_sales(url: str, html_text: str, max_pages: int = 1000):
+    """③ 注文実績ページ。sales_1.html → sales_2.html … と自動でめくる。
+    BUYMAの注文実績ページは1ページ30件が基本のため、30件未満のページに当たったら
+    「本当に最後のページまで読み終えた」とみなす（reached_last_page=True）。
+    max_pagesは「無限ループを防ぐための安全装置」であり、通常の出品者数では
+    実質上限なしで最後のページまで読み込む（1000ページ＝3万件は現実的には超えない想定）。
+    それでも打ち切った場合は reached_last_page=False を返し、
+    呼び出し側でその旨を正直に表示できるようにする（高出品数の出品者だと
+    「出品開始日」「初めて売れた日」がさかのぼりきれず、実際より新しく見えてしまうため）。"""
     if html_text and html_text.strip():
-        return parse_sales_page(html_text), []
+        return parse_sales_page(html_text), [], True
     if not url or not url.strip():
-        return [], ["③ のURLもHTMLも未入力のため、注文実績のチェックはスキップします。"]
+        return [], ["③ のURLもHTMLも未入力のため、注文実績のチェックはスキップします。"], True
 
     url = url.strip()
     can_paginate = bool(re.search(r"sales_\d+\.html", url))
     all_orders, errors = [], []
     pages = max_pages if can_paginate else 1
+    reached_last_page = True
 
     for n in range(1, pages + 1):
         page_url = re.sub(r"sales_\d+\.html", f"sales_{n}.html", url) if can_paginate else url
@@ -482,9 +514,11 @@ def load_sales(url: str, html_text: str, max_pages: int = 12):
         if not ords:
             break
         all_orders.extend(ords)
-        if len(ords) < 5:  # 最終ページらしい
+        if len(ords) < 30:  # 1ページ30件に満たない＝本当に最後のページ
             break
-    return all_orders, errors
+        if n == pages and can_paginate:
+            reached_last_page = False  # まだ30件フルで、ページ数の上限で打ち切った
+    return all_orders, errors, reached_last_page
 
 
 def extract_country(html: str):
@@ -1200,14 +1234,18 @@ def render_seller_tool():
         if not sales_url.strip() and not sales_html.strip() and seller_id:
             sales_url = f"https://www.buyma.com/buyer/{seller_id}/sales_1.html"
 
-        with st.spinner("BUYMAのページを読み込み中…（10〜30秒ほどかかることがあります）"):
+        with st.spinner(
+            "BUYMAのページを読み込み中…（注文実績は最後のページまで読み込みます。"
+            "出品数・注文実績が多い出品者ほど時間がかかり、数分かかることがあります）"
+        ):
             items, total_count, last_page, e1, reached_last_page = load_listing(brand_url, brand_html)
-            orders, e2 = load_sales(sales_url, sales_html)
+            orders, e2, sales_reached_last_page = load_sales(sales_url, sales_html)
             profile = load_profile(profile_url, profile_html)
         now = dt.datetime.now()
         new_result = dict(
             items=items, total_count=total_count, last_page=last_page, reached_last_page=reached_last_page,
-            orders=sorted(orders, key=lambda o: o["date"]), profile=profile, brand_name=brand_name,
+            orders=sorted(orders, key=lambda o: o["date"]), sales_reached_last_page=sales_reached_last_page,
+            profile=profile, brand_name=brand_name,
             profile_url=profile_url.strip(), brand_url=brand_url.strip(), auto_brand_url=auto_brand_url,
             errors=[m for m in (*e1, *e2) if m],
             checked_at=f"{now.month}/{now.day} {now.hour:02d}:{now.minute:02d}",
@@ -1228,6 +1266,7 @@ def render_seller_tool():
 
     items = res["items"]
     orders = res["orders"]
+    sales_reached_last_page = res.get("sales_reached_last_page", True)
     typed_brand = (res["brand_name"] or "").strip()
 
     # ②のURLで出品一覧はすでにブランド絞り込み済みなのに、「対象ブランド名」欄が空欄・不一致だと
@@ -1427,6 +1466,14 @@ def render_seller_tool():
         )
         c.metric("月あたりの平均販売数", f"約 {avg_per_month:.1f} 件")
 
+        if not sales_reached_last_page:
+            st.warning(
+                f"⚠️ 注文実績が多いため、直近{len(orders)}件（{first_sale:%Y/%m}〜{last_sale:%Y/%m}）までしか"
+                "確認できていません。それより前の注文実績は含まれていないため、"
+                "「出品開始 → 初めて売れるまで」「確認できた販売件数」「月あたりの平均販売数」は、"
+                "実際より新しく・少なく出ている可能性があります。"
+            )
+
         if lag is not None and lag < 0:
             st.caption(
                 "※ このブランドの出品開始日より前の日付の注文が見つかったため、初回販売までの日数は計算していません"
@@ -1561,11 +1608,12 @@ def render_seller_tool():
             st.caption(
                 f"確認できた注文実績{len(orders)}件のうち、商品名からブランド名を推定できた"
                 f"{sum(sold_brand_counts.values())}件を集計しています（{unknown}件は商品名を取得できず対象外）。"
-                "商品名の先頭の単語をブランド名とみなす簡易的な推定のため、精度には限界があります。"
+                "商品名からブランド名っぽい単語を探す簡易的な推定のため、精度には限界があります。"
                 "「ブランドページ」はBUYMA内のキーワード検索結果を開くリンクのため、"
                 "うまくブランド名を推定できていない行では関係のないページが開くことがあります。"
                 "「出品数」は取得できた出品一覧の範囲での点数（出品数が多い出品者では実際より少なく出ることがあります）、"
-                "「総販売数」は確認できた注文実績の中での件数です。"
+                "「総販売数」は確認できた注文実績の中での件数です"
+                + ("（注文実績が多いため直近分のみで、古い実績は含まれていません）。" if not sales_reached_last_page else "。")
             )
 
             # ランキング上位ブランドについて、月ごとの販売数も見られるように
@@ -1721,171 +1769,174 @@ def render_seller_tool():
     )
 
 
-# ============================ 画面：② 複数人まとめてチェック ============================
-BULK_MAX_SELLERS = 10
+# ============================ 画面：② 商品ごとの価格チェック ============================
+# 関税率の目安（2026年4月1日時点、税関の公式ページ2本をもとに作成）：
+#   - 一般税率（商用輸入・個人輸入どちらにも使える正式な税率）
+#     https://www.customs.go.jp/tetsuzuki/c-answer/imtsukan/1204_jr.htm （主な商品の関税率の目安）
+#   - 簡易税率（課税価格20万円以下の個人輸入だけに使える簡易な税率。
+#     革製バッグ・ニット製衣類・履物は対象外で、個人輸入でも一般税率を使うことになっている）
+#     https://www.customs.go.jp/tsukan/kanizeiritsu.htm （少額輸入貨物の簡易税率）
+# 実際の税率は素材・原産国・加工の有無などで変わるため、ここでの数字は目安（レンジの中間値）。
+_DUTY_CATEGORIES = {
+    "選択してください": None,
+    "皮バッグ（ハンドバッグ等）": {
+        "personal": 12.0, "commercial": 12.0,
+        "note": "革製バッグは簡易税率の対象外のため、個人輸入でも一般税率（目安8〜16%、中間値12%）になります。",
+    },
+    "フェイクレザー（合成皮革バッグ等）": {
+        "personal": 12.0, "commercial": 12.0,
+        "note": (
+            "合成皮革・PVC素材のバッグも、本革製バッグと同じ関税分類（ハンドバッグとして同じ税率区分）"
+            "になるため、税率は本革と同じ目安8〜16%（中間値12%）です。"
+        ),
+    },
+    "革靴（レザーシューズ）": {
+        "personal": 30.0, "commercial": 30.0,
+        "note": (
+            "靴も簡易税率の対象外です。一般税率は「30%」または「1足あたり4,300円」の高い方になるため、"
+            "価格が安いほど実質の税率は上がります。安価な商品は、この%欄だけでは正確に出ないことがあるので、"
+            "通関手数料欄も使って手動で調整してください。"
+        ),
+    },
+    "Tシャツ": {
+        "personal": 9.0, "commercial": 9.0,
+        "note": (
+            "綿・ポリエステルなど素材に関わらず、Tシャツの生地は「メリヤス編み＝引っ張ると伸びる生地」"
+            "に分類されるため（セーターと同じ区分）、簡易税率の対象外です。一般税率の目安は7.4〜10.9%（中間値9%）。"
+        ),
+    },
+    "アウター（織物・毛皮以外）": {
+        "personal": 10.0, "commercial": 10.6,
+        "note": (
+            "織物素材のコート・ジャケットを想定。個人輸入（課税価格20万円以下）なら簡易税率10%、"
+            "商用輸入は一般税率の目安8.4〜12.8%（中間値10.6%）。セーターなどニット素材の場合は、"
+            "個人輸入でも簡易税率の対象外になるため商用と同じ一般税率を使ってください。"
+        ),
+    },
+    "ジャケット": {
+        "personal": 10.0, "commercial": 10.6,
+        "note": "アウターと同じ区分（繊維製のコート・ジャケット類）のため、税率も同じです。ニット素材の場合は商用と同じ一般税率になります。",
+    },
+    "ジャンバー（ブルゾン等）": {
+        "personal": 10.0, "commercial": 10.6,
+        "note": "アウターと同じ区分（繊維製のコート・ジャケット類）のため、税率も同じです。ニット素材の場合は商用と同じ一般税率になります。",
+    },
+    "ウールコート": {
+        "personal": 10.0, "commercial": 10.6,
+        "note": "毛皮ではなくウール生地のコートを想定。アウターと同じ区分のため税率も同じです（毛皮コートは下の「ファーアウター」を選んでください）。",
+    },
+    "ファーアウター（毛皮）": {
+        "personal": 20.0, "commercial": 20.0,
+        "note": "毛皮製品は簡易税率・一般税率のどちらも20%です。",
+    },
+    "ボトムス（パンツ・スカート/織物）": {
+        "personal": 10.0, "commercial": 10.6,
+        "note": (
+            "織物素材のパンツ・スカートを想定。個人輸入（課税価格20万円以下）なら簡易税率10%、"
+            "商用輸入は一般税率の目安8.4〜12.8%（中間値10.6%）。"
+        ),
+    },
+    "ニット（セーター等）": {
+        "personal": 10.6, "commercial": 10.6,
+        "note": (
+            "セーター・カーディガンなどのニット（メリヤス編み）製品は簡易税率の対象外。"
+            "個人輸入・商用輸入どちらも一般税率の目安8.4〜12.8%（中間値10.6%）になります。"
+        ),
+    },
+    "スウェット": {
+        "personal": 10.6, "commercial": 10.6,
+        "note": (
+            "スウェット（トレーナー）もニットと同じ編み物生地のため簡易税率の対象外。"
+            "個人輸入・商用輸入どちらも一般税率の目安8.4〜12.8%（中間値10.6%）になります。"
+        ),
+    },
+    "マフラー（スカーフ類）": {
+        "personal": 10.0, "commercial": 6.8,
+        "note": (
+            "織物素材のマフラー・スカーフを想定。個人輸入（課税価格20万円以下）は簡易税率10%、"
+            "商用輸入は一般税率の目安4.4〜9.1%（中間値6.8%）。ニット編みのマフラーの場合は、"
+            "個人輸入でも簡易税率の対象外になるため商用と同じ一般税率を使ってください。"
+        ),
+    },
+    "アクセサリー（貴金属・宝石）": {
+        "personal": 5.0, "commercial": 5.3,
+        "note": (
+            "金・銀・プラチナ・貴石製のアクセサリーを想定。商用輸入は一般税率の目安5.2〜5.4%（中間値5.3%）、"
+            "個人輸入（課税価格20万円以下）は簡易税率の「その他のもの」区分5%を目安にしています。"
+            "メッキなど貴金属以外の素材（コスチュームジュエリー）は税率が異なることがあります。"
+        ),
+    },
+}
 
 
-def render_bulk_tool():
-    st.title("📋 複数人まとめてチェック")
-    st.write("**同じブランドを扱っている出品者を、何人かまとめて比較したいときに使うツールです。**")
-    with st.expander("使い方（クリックで開く）"):
-        st.markdown("**① 各出品者の「ブランドで絞った新着ページ」のリンクを、1行に1人ずつ貼る**")
-        st.markdown(f"**② 同じ並び順で「注文実績ページ」のリンクを、1行に1人ずつ貼る**（任意・最大{BULK_MAX_SELLERS}人まで）")
-        st.write("")
-        st.markdown("「🔎 出品者チェック」より情報は少なめですが、出品総数・出品ペース・売れ行き・拠点国をまとめて比較できます。")
-
-    with st.form("bulk_form"):
-        brand_name_bulk = st.text_input(
-            "対象ブランド名（販売件数のしぼり込み・候補リスト保存用。任意）", placeholder="例）LOEWE",
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            urls_text = st.text_area(
-                "① 出品者ごとの「ブランド一覧（新着順）」URL（1行に1人）",
-                height=180,
-                placeholder=(
-                    "https://www.buyma.com/buyer/1111111/item_1.html\n"
-                    "https://www.buyma.com/r/-B2222222/\n"
-                    "…"
-                ),
-            )
-        with c2:
-            sales_urls_text = st.text_area(
-                "② 同じ順番で「注文実績」URL（1行に1人・任意）",
-                height=180,
-                placeholder=(
-                    "https://www.buyma.com/buyer/1111111/sales_1.html\n"
-                    "https://www.buyma.com/buyer/2222222/sales_1.html\n"
-                    "…"
-                ),
-                help="①と同じ順番で1行ずつ貼ってください。分からない人は空行のままでOKです（その人の販売実績は「不明」になります）。",
-            )
-        go3 = st.form_submit_button("まとめてチェックする", type="primary", use_container_width=True)
-
-    if go3:
-        all_lines = [u.strip() for u in urls_text.splitlines() if u.strip()]
-        urls = all_lines[:BULK_MAX_SELLERS]
-        sales_lines = sales_urls_text.splitlines()
-        if len(all_lines) > BULK_MAX_SELLERS:
-            st.warning(f"URLは最大{BULK_MAX_SELLERS}件までです。上から{BULK_MAX_SELLERS}件だけ処理します。")
-
-        rows = []
-        with st.spinner(f"{len(urls)}人分のページを読み込み中…（人数分、時間がかかります）"):
-            for i, u in enumerate(urls):
-                sales_url = sales_lines[i].strip() if i < len(sales_lines) else ""
-                row = {"一覧URL": u, "注文実績URL": sales_url}
-                try:
-                    items, total_count, _, errs, reached_last_page = load_listing(u, "", back_pages=2)
-                    if not items:
-                        row["エラー"] = "商品を読み取れませんでした" + (f"（{errs[0]}）" if errs else "")
-                        rows.append(row)
-                        continue
-
-                    dated = sorted(it["listed_on"] for it in items if it["listed_on"])
-                    oldest = dated[0] if dated else None
-                    newest = dated[-1] if dated else None
-                    total_disp = total_count or len(items)
-                    # 「最後のページ」まで実際に確認できていない場合、一番古い出品日・出品ペースは
-                    # 実態とかけ離れた数字になるため表示しない（出品数が多い出品者ほど起きやすい）
-                    if oldest and newest and reached_last_page:
-                        pace_text = format_pace((newest - oldest).days, total_disp)
-                    else:
-                        pace_text = "算出不可（最後のページを確認できず）"
-                        oldest = None
-                    prices = [it["price"] for it in items if it["price"]]
-                    median_price = int(statistics.median(prices)) if prices else None
-
-                    seller_id = guess_seller_id(u)
-                    name, country, profile_url = None, None, ""
-                    if seller_id:
-                        profile_url = f"https://www.buyma.com/buyer/{seller_id}.html"
-                        prof = load_profile(profile_url, "")
-                        name, country = prof.get("name"), prof.get("country")
-
-                    sales_count_text, sales_avg_text, first_sale_text = "不明", "不明", "不明"
-                    if sales_url:
-                        try:
-                            orders, _ = load_sales(sales_url, "", max_pages=3)
-                        except Exception:  # noqa: BLE001
-                            orders = []
-                        if orders:
-                            brand_orders = [o for o in orders if order_matches_brand(o, brand_name_bulk)]
-                            use_orders = brand_orders if (brand_name_bulk and brand_orders) else orders
-                            o_dates = sorted(o["date"] for o in use_orders)
-                            months = month_span(o_dates[0], o_dates[-1])
-                            sales_count_text = f"{len(use_orders)}件"
-                            sales_avg_text = f"月{len(use_orders) / len(months):.1f}件"
-                            first_sale_text = f"{o_dates[0].year}/{o_dates[0].month}/{o_dates[0].day}"
-                        else:
-                            sales_count_text, sales_avg_text = "0件", "0件"
-                            first_sale_text = "実績なし・非公開"
-
-                    row.update({
-                        "出品者名": name or "（不明）",
-                        "拠点国": country or "（不明）",
-                        "出品総数": total_disp,
-                        "扱い始めた日": f"{oldest.year}/{oldest.month}/{oldest.day}" if oldest else "不明",
-                        "初めて売れた日": first_sale_text,
-                        "出品ペース": pace_text,
-                        "最終出品からの経過": humanize_since(newest) if newest else "不明",
-                        "価格帯の中央値": yen(median_price) if median_price else "不明",
-                        "販売件数": sales_count_text,
-                        "月あたりの平均販売数": sales_avg_text,
-                        "プロフィールURL": profile_url,
-                    })
-                except Exception as e:  # noqa: BLE001
-                    row["エラー"] = f"取得できませんでした（{e}）"
-                rows.append(row)
-
-        st.session_state["bulk_result"] = dict(brand_name=brand_name_bulk, rows=rows)
-
-    bres = st.session_state.get("bulk_result")
-    if not bres:
-        st.info(f"上のフォームにURLを貼って（最大{BULK_MAX_SELLERS}人）「まとめてチェックする」を押してください。")
+def _apply_duty_category():
+    """カテゴリー・個人/商用の選択に応じて、関税率欄の数字を書き換える（selectbox/radioのon_change用）。"""
+    cat = _DUTY_CATEGORIES.get(st.session_state.get("duty_category"))
+    if not cat:
         return
-
-    rows = bres["rows"]
-    ok_rows = [r for r in rows if "エラー" not in r]
-    err_rows = [r for r in rows if "エラー" in r]
-
-    if ok_rows:
-        cols = ["出品者名", "拠点国", "出品総数", "扱い始めた日", "初めて売れた日", "出品ペース",
-                "最終出品からの経過", "価格帯の中央値", "販売件数", "月あたりの平均販売数", "一覧URL"]
-        st.dataframe(pd.DataFrame(ok_rows)[cols], use_container_width=True, hide_index=True)
-        st.caption(
-            "※「初めて売れた日」「販売件数」「月あたりの平均販売数」は②の注文実績URLを入力した人だけ表示されます"
-            "（ブランド名を入力していれば、そのブランドだけにしぼった件数・日付です）。"
-        )
-        if st.button("⭐ この一覧を候補リストに追加", key="add_watchlist_bulk"):
-            for r in ok_rows:
-                add_to_watchlist({
-                    "追加日時": f"{TODAY.year}/{TODAY.month}/{TODAY.day}",
-                    "出品者名": r["出品者名"],
-                    "拠点国": r["拠点国"],
-                    "ブランド名": bres["brand_name"] or "（未入力）",
-                    "ブランドページURL": buyma_brand_search_url(bres["brand_name"]) if bres["brand_name"] else "",
-                    "出品総数": r["出品総数"],
-                    "扱い始めた日": r["扱い始めた日"],
-                    "初めて売れた日": r["初めて売れた日"],
-                    "出品ペース": r["出品ペース"],
-                    "最終出品からの経過": r["最終出品からの経過"],
-                    "一覧URL": r["一覧URL"],
-                    "プロフィールURL": r["プロフィールURL"],
-                })
-            st.success(f"{len(ok_rows)}件を候補リストに追加しました。「📒 ブランド候補リスト」タブから確認できます。")
-    else:
-        st.info("読み取れた出品者がいませんでした。")
-
-    for r in err_rows:
-        st.warning(f"{r['一覧URL']}：{r['エラー']}")
-
-    st.caption(
-        "※ このタブは複数人をすばやく比較するための簡易版です。詳しく調べたい出品者が見つかったら、"
-        "「🔎 出品者チェック」タブで改めて詳しく確認することをおすすめします。"
-    )
+    mode = "personal" if st.session_state.get("duty_mode") == "個人輸入" else "commercial"
+    st.session_state["duty_rate_pct"] = cat[mode]
 
 
-# ============================ 画面：③ 商品ごとの価格チェック ============================
+# 通関手数料の目安（配送会社によって課税方式が大きく違う）：
+#   - 日本郵便（EMS・国際郵便）：関税等を着払いで徴収する際の取扱手数料は郵便物1個につき200円
+#     https://www.customs.go.jp/tetsuzuki/c-answer/kokusaiyubin/6101_jr.htm
+#   - DHL：立替納税手数料は「2,530円」または「立替額（関税＋消費税）の2%」の高い方（アカウント請求の場合）
+#   - FedEx：立替手数料（ADVC）は従来1,000円。2026年7月に改定されており、最新額は要確認
+_CLEARANCE_CARRIERS = {
+    "選択してください": None,
+    "日本郵便（EMS・国際郵便）": {"type": "fixed", "value": 200,
+                           "note": "関税等を着払いで徴収する際の取扱手数料は、郵便物1個につき200円です。"},
+    "DHL": {"type": "dhl", "min": 2530, "rate": 0.02,
+            "note": "立替納税手数料は「2,530円」または「関税・消費税の立替額の2%」の高い方です（アカウント請求の場合）。"},
+    "FedEx": {"type": "fixed", "value": 1000,
+              "note": "立替手数料（ADVC）の目安は1,000円ですが、2026年7月に料金改定があったため最新額はFedEx公式サイトでご確認ください。"},
+}
+
+
+def _apply_clearance_fee():
+    """配送会社の選択に応じて、通関手数料欄の数字を書き換える（selectboxのon_change用）。
+    DHLは「立替額（関税＋消費税）の2%」が絡むため、関税率・課税価格をsession_stateから読み直して計算する。"""
+    carrier = _CLEARANCE_CARRIERS.get(st.session_state.get("clearance_carrier"))
+    if not carrier:
+        return
+    if carrier["type"] == "fixed":
+        st.session_state["clearance_fee"] = carrier["value"]
+    elif carrier["type"] == "dhl":
+        buy = st.session_state.get("single_buy_price", 0) or 0
+        ship = st.session_state.get("os_ship_price", 0) or 0
+        mode_rate = 0.6 if st.session_state.get("duty_mode") == "個人輸入" else 1.0
+        taxable = int(((buy + ship) * mode_rate) // 1000) * 1000  # 課税価格は1,000円未満切り捨て
+        duty_rate = (st.session_state.get("duty_rate_pct", 0) or 0) / 100
+        duty = int((taxable * duty_rate) // 100) * 100  # 関税額は100円未満切り捨て
+        tax = (taxable + duty) * 0.10
+        st.session_state["clearance_fee"] = int(round(max(carrier["min"], (duty + tax) * carrier["rate"])))
+
+
+# 国内配送方法の目安料金：
+#   クリックポスト・レターパック系は2026年10月1日の日本郵便料金改定後の金額
+#   https://jobdonebot.com/blog/japan-post-price-hike-2026-10-guide
+#   かんたんBUYMA便（匿名配送）はBUYMA・日本郵便間の料金表の実際の金額（ユーザー確認済み）
+_DOMESTIC_SHIP_METHODS = {
+    "選択してください": None,
+    "クリックポスト": 240,
+    "レターパックライト": 430,
+    "レターパックプラス": 600,
+    "かんたんBUYMA便【匿名配送】-ゆうパケット": 280,
+    "かんたんBUYMA便【匿名配送】-ゆうパック 60サイズ": 800,
+    "かんたんBUYMA便【匿名配送】-ゆうパック 80サイズ": 950,
+    "かんたんBUYMA便【匿名配送】-ゆうパック 100サイズ": 1100,
+    "かんたんBUYMA便【匿名配送】-ゆうパック 120サイズ": 1250,
+}
+
+
+def _apply_domestic_ship():
+    """配送方法の選択に応じて、国内送料欄の数字を書き換える（selectboxのon_change用）。"""
+    value = _DOMESTIC_SHIP_METHODS.get(st.session_state.get("domestic_ship_method"))
+    if value is not None:
+        st.session_state["jp_ship_price"] = value
+
+
 def render_price_tool():
     st.title("💰 商品ごとの価格チェック")
     st.write(
@@ -2100,24 +2151,107 @@ def render_price_tool():
         st.caption(f"💡 「{fs_amount:,.2f} {fs_currency or ''}{yen_text} 以上で送料無料」という記載がページ内に見つかりました。")
 
     st.markdown("**原価の内訳（自動入力された金額は書き換えできます）**")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         buy_price2 = st.number_input(
-            "① 仕入れ価格（円）", min_value=0, value=default_buy_jpy, step=1000, key="single_buy_price",
+            "① 仕入れ価格＝商品代金（円）", min_value=0, value=default_buy_jpy, step=1000, key="single_buy_price",
             help="外貨の場合は、円換算した金額を入力してください（自動入力を書き換え可）。",
         )
     with c2:
         os_ship2 = st.number_input(
-            "② 海外からの送料（円）", min_value=0, value=0, step=500, key="os_ship_price",
+            "② 海外からの送料＝国際送料（円）", min_value=0, value=0, step=500, key="os_ship_price",
             help="仕入れ先から日本（または転送会社）に届くまでの送料です。サイトで確認した実際の金額を入力してください。",
         )
-    with c3:
-        jp_ship2 = st.number_input(
-            "③ 国内送料・その他経費（円）", min_value=0, value=0, step=500, key="jp_ship_price",
-            help="転送会社の手数料、国内発送料、梱包資材代など、そのほかにかかる経費をまとめて入れてください。",
-        )
 
-    cost2 = buy_price2 + os_ship2 + jp_ship2
+    st.markdown("**③ 関税・消費税を計算する**")
+
+    cat1, cat2 = st.columns(2)
+    with cat1:
+        st.radio(
+            "個人輸入・商用輸入", ["個人輸入", "商用輸入"], key="duty_mode", horizontal=True,
+            on_change=_apply_duty_category,
+            help=(
+                "個人輸入：自分で使う目的の輸入で使える計算方法。課税価格＝（商品代金＋送料）×60%。\n"
+                "商用輸入：転売・事業目的の輸入で使う計算方法。課税価格＝（商品代金＋送料）×100%（割引なし）。\n\n"
+                "※ 0.6倍ルールについて：税関の「少額輸入貨物の簡易税率」ページには今も0.6倍ルールが"
+                "記載されていますが、このページは2025年5月更新のままで、2026年4月の関税定率法改正"
+                "（令和8年法律第5号、同日施行）が反映されていない可能性があります。改正後の扱いは"
+                "ページによって記載が食い違っているため、不安な場合は税関相談官に確認してください。"
+            ),
+        )
+    with cat2:
+        st.selectbox(
+            "商品カテゴリーから関税率を入れる（任意）",
+            list(_DUTY_CATEGORIES.keys()), key="duty_category", on_change=_apply_duty_category,
+            help="選ぶと下の「関税率（%）」に目安の数字が自動で入ります。入力後も自由に書き換えられます。",
+        )
+    selected_cat = _DUTY_CATEGORIES.get(st.session_state.get("duty_category"))
+    if selected_cat:
+        st.caption(f"💡 {selected_cat['note']}")
+
+    duty_mode_rate = 0.6 if st.session_state.get("duty_mode") == "個人輸入" else 1.0
+    taxable_value2_raw = (buy_price2 + os_ship2) * duty_mode_rate
+    taxable_value2 = int(taxable_value2_raw // 1000) * 1000  # 課税価格は1,000円未満切り捨て
+    if st.session_state.get("duty_mode") == "個人輸入":
+        st.caption(f"課税価格 ＝（商品代金＋送料）×60% ＝ {yen(taxable_value2)}（1,000円未満切り捨て）")
+    else:
+        st.caption(f"課税価格 ＝（商品代金＋送料）×100% ＝ {yen(taxable_value2)}（1,000円未満切り捨て）")
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        duty_rate_pct = st.number_input(
+            "関税率（%）", min_value=0.0, max_value=50.0, value=0.0, step=0.5, key="duty_rate_pct",
+            help=(
+                "上のカテゴリーを選ぶと自動入力されますが、正確な税率は商品ごとに違うため、"
+                "分かる場合はここを書き換えてください。\n\n"
+                "課税価格1万円以下は原則免税ですが、かばん類・ニット製衣類・靴などは金額に関わらず"
+                "免税の対象外です（BUYMAで扱う商品の多くが該当するため要注意）。\n\n"
+                "さらに2028年4月からは、1万円以下の消費税免税が廃止され、大手プラットフォーム経由の"
+                "輸入には消費税の納税義務が課される予定です。個人輸入の税優遇は今後さらに縮小していく見込みです。"
+            ),
+        )
+    with cc2:
+        st.selectbox(
+            "通関業者（配送会社）から通関手数料を入れる（任意）",
+            list(_CLEARANCE_CARRIERS.keys()), key="clearance_carrier", on_change=_apply_clearance_fee,
+            help="選ぶと下の「通関手数料」に目安の数字が自動で入ります。入力後も自由に書き換えられます。",
+        )
+        selected_carrier = _CLEARANCE_CARRIERS.get(st.session_state.get("clearance_carrier"))
+        if selected_carrier:
+            st.caption(f"💡 {selected_carrier['note']}")
+        clearance_fee2 = st.number_input(
+            "通関手数料（円・任意）", min_value=0, value=0, step=100, key="clearance_fee",
+            help="利用する配送会社・転送会社によって発生する通関手数料です（無ければ0のままでOK）。",
+        )
+    duty2_raw = taxable_value2 * (duty_rate_pct / 100)
+    duty2 = int(duty2_raw // 100) * 100  # 関税額は100円未満切り捨て
+    consumption_tax2 = (taxable_value2 + duty2) * 0.10
+    customs2 = duty2 + consumption_tax2 + clearance_fee2
+    if duty_rate_pct > 0:
+        st.caption(
+            f"課税価格 {yen(taxable_value2)} → 関税 {yen(duty2)} ＋ 消費税 {yen(consumption_tax2)} "
+            f"＋ 通関手数料 {yen(clearance_fee2)} ＝ **関税・消費税の合計 {yen(customs2)}**"
+        )
+    else:
+        st.caption("関税率を入力すると、ここに関税・消費税の合計が表示されます（0%のままなら0円として計算します）。")
+
+    st.markdown("**④ 国内送料・その他経費**")
+    st.selectbox(
+        "配送方法から国内送料を入れる（任意）",
+        list(_DOMESTIC_SHIP_METHODS.keys()), key="domestic_ship_method", on_change=_apply_domestic_ship,
+        help=(
+            "お客様に発送するときの国内配送方法です。選ぶと下の金額欄に自動で入ります。"
+            "「かんたんBUYMA便」は、BUYMAと日本郵便が連携した匿名配送サービスです"
+            "（ゆうパケット・ゆうパックのサイズ別料金）。実際のサイズは商品によって変わるため、"
+            "選んだあとも金額欄は自由に書き換えてください。"
+        ),
+    )
+    jp_ship2 = st.number_input(
+        "国内送料・その他経費（円）", min_value=0, value=0, step=500, key="jp_ship_price",
+        help="転送会社の手数料、国内発送料、梱包資材代など、そのほかにかかる経費をまとめて入れてください。",
+    )
+
+    cost2 = buy_price2 + os_ship2 + customs2 + jp_ship2
     if cost2 == 0:
         st.info("仕入れ価格を入力すると、利益の目安を計算します。")
         return
@@ -2132,11 +2266,11 @@ def render_price_tool():
     st.markdown("**① ライバル（この出品者）は、実際どれくらい利益を乗せているか**")
     st.table(pd.DataFrame(
         {"金額": [
-            yen(buy_price2), yen(os_ship2), yen(jp_ship2), yen(cost2), yen(breakeven2),
+            yen(buy_price2), yen(os_ship2), yen(customs2), yen(jp_ship2), yen(cost2), yen(breakeven2),
             yen(actual_price), f"−{yen(actual_price * FEE_RATE)}", yen(net2), yen(profit2), f"{rate2 * 100:.1f} %",
         ]},
         index=[
-            "仕入れ価格", "海外送料", "国内送料・その他経費", "原価合計",
+            "仕入れ価格", "海外送料", "関税・消費税", "国内送料・その他経費", "原価合計",
             "損益分岐売価（これ以下は赤字）", "ライバルの実際の販売価格", "BUYMA手数料（7.7%）",
             "手数料を引いた受取額", "ライバルの実利益", "ライバルの利益率",
         ],
@@ -2164,14 +2298,26 @@ def render_price_tool():
     st.table(pd.DataFrame(target_rows).set_index("目標の利益率"))
     st.caption(
         "※ 為替レートは取得できた時点のものです。カード決済時のレートや手数料で実際の金額とは多少ずれます。"
-        "関税やBUYMA以外の手数料は含んでいません。"
+        "関税・消費税は「①仕入れ価格＋②海外送料」を課税価格とみなし、上で入力した関税率をもとに自動計算しています。"
+        "関税率そのものはカテゴリーごとに異なるため手入力です。それ以外のBUYMA以外の手数料は含んでいません。"
+    )
+    st.info(
+        "💡 **関税の目安について**：2026年4月1日に制度が変わりました。以前は「課税価格＝海外価格×0.6」"
+        "だったため約1万6,666円までが実質免税でしたが、この0.6倍の特例が廃止され、"
+        "今は海外価格＋送料（CIF価格）がそのまま課税価格になります。"
+        "**課税価格が1万円以下**なら原則として関税・消費税が免除されます。"
+        "ただし**かばん類・ニット製衣類・靴などは、金額に関わらずこの免税の対象外**です。"
+        "BUYMAで扱う商品はこれらのカテゴリーが多いため、免税になると思い込まないようご注意ください。"
+        "目安として、関税（カテゴリーにより8〜16%程度）＋消費税10%で、"
+        "合計は価格のだいたい20〜25%程度になることが多いです。"
+        "最新のルールは[税関のサイト](https://www.customs.go.jp/tsukan/kanizeiritsu.htm)でご確認ください。"
     )
 
 
-# ============================ 画面：④ 候補リスト ============================
+# ============================ 画面：③ 候補リスト ============================
 def render_watchlist_tool():
     st.title("📒 ブランド候補リスト")
-    st.write("**「🔎 出品者チェック」や「📋 複数人まとめてチェック」で気になった出品者を保存しておく場所です。**")
+    st.write("**「🔎 出品者チェック」で気になった出品者を保存しておく場所です。**")
     st.caption("このリストはブラウザを閉じると消えます。")
     st.caption("あとで見返したいときは、CSVでダウンロードしてGoogleスプレッドシートやエクセルに保存してください。")
 
@@ -2179,7 +2325,7 @@ def render_watchlist_tool():
     if not wl:
         st.info(
             "まだ候補リストに追加された出品者がありません。"
-            "「🔎 出品者チェック」または「📋 複数人まとめてチェック」の結果画面にある「候補リストに追加」ボタンから追加できます。"
+            "「🔎 出品者チェック」の結果画面にある「候補リストに追加」ボタンから追加できます。"
         )
         return
 
@@ -2210,16 +2356,14 @@ def render_watchlist_tool():
 
 # ============================ エントリーポイント ============================
 def main():
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🔎 出品者チェック", "📋 複数人まとめてチェック", "💰 商品ごとの価格チェック", "📒 ブランド候補リスト",
+    tab1, tab2, tab3 = st.tabs([
+        "🔎 出品者チェック", "💰 商品ごとの価格チェック", "📒 ブランド候補リスト",
     ])
     with tab1:
         render_seller_tool()
     with tab2:
-        render_bulk_tool()
-    with tab3:
         render_price_tool()
-    with tab4:
+    with tab3:
         render_watchlist_tool()
 
 
