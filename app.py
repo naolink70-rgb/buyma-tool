@@ -861,6 +861,12 @@ def clean_name(name: str) -> str:
 _BRAND_STOPWORDS = {
     "MEN'S", "WOMEN'S", "MENS", "WOMENS", "KIDS", "UNISEX",
     "GIRL'S", "BOY'S", "NEW", "SALE", "BUYMA",
+    # 色・サイズ・仕様など、ブランド名ではない英単語
+    "BLACK", "WHITE", "GREEN", "BLUE", "RED", "GRAY", "GREY", "NAVY", "BEIGE", "BROWN", "PINK",
+    "YELLOW", "ORANGE", "PURPLE", "KHAKI", "IVORY", "SILVER", "GOLD", "CREAM", "OLIVE", "CAMEL",
+    "BURGUNDY", "WINE", "MINT", "LIME", "TAN", "CHARCOAL", "MULTI", "BLK", "WHT", "GRY", "NVY",
+    "FREE", "SIZE", "SET", "LIMITED", "JAPAN", "KOREA", "WOMEN", "MEN", "LOGO", "BASIC",
+    "SMALL", "MEDIUM", "LARGE", "ONE", "NEW",
 }
 
 _KNOWN_BRANDS = [
@@ -882,7 +888,33 @@ _KNOWN_BRANDS = [
 ]
 
 
+# 商品名にカタカナや別表記で書かれているブランド名を、正式なブランド名に直すための対応表。
+# （カタカナは「・」とスペースを除いた形で照合する）
+_BRAND_ALIASES = {
+    "ザノースフェイス": "THE NORTH FACE", "ノースフェイス": "THE NORTH FACE",
+    "NORTH FACE": "THE NORTH FACE", "TNF": "THE NORTH FACE",
+    "ステューシー": "STUSSY", "ナイキ": "NIKE", "アディダス": "ADIDAS",
+    "ニューバランス": "NEW BALANCE", "シュプリーム": "SUPREME", "パタゴニア": "PATAGONIA",
+    "ヴァンズ": "VANS", "バンズ": "VANS", "コンバース": "CONVERSE",
+    "ラルフローレン": "RALPH LAUREN", "カナダグース": "CANADA GOOSE",
+    "シャネル": "CHANEL", "エルメス": "HERMES", "ルイヴィトン": "LOUIS VUITTON",
+    "グッチ": "GUCCI", "プラダ": "PRADA", "ディオール": "DIOR", "フェンディ": "FENDI",
+    "セリーヌ": "CELINE", "バレンシアガ": "BALENCIAGA", "バーバリー": "BURBERRY",
+    "ミュウミュウ": "MIU MIU", "ヴァレンティノ": "VALENTINO", "バレンティノ": "VALENTINO",
+    "ジバンシィ": "GIVENCHY", "ジバンシー": "GIVENCHY", "ゴヤール": "GOYARD",
+    "モンクレール": "MONCLER", "ロエベ": "LOEWE", "コーチ": "COACH", "アグ": "UGG",
+    "ストーンアイランド": "STONE ISLAND", "ジルサンダー": "JIL SANDER",
+}
+
+
 def _find_known_brand(text_upper: str) -> str:
+    kata = text_upper.replace("・", "").replace(" ", "").replace("　", "")
+    for alias, canonical in _BRAND_ALIASES.items():
+        if re.fullmatch(r"[A-Z ]+", alias):
+            if re.search(r"(?<![A-Za-z])" + re.escape(alias) + r"(?![A-Za-z])", text_upper):
+                return canonical
+        elif alias in kata:
+            return canonical
     for b in _KNOWN_BRANDS:
         pattern = r"(?<![A-Za-z])" + re.escape(b) + r"(?![A-Za-z])"
         if re.search(pattern, text_upper):
@@ -907,6 +939,13 @@ _KATAKANA_STOPWORDS = {
     # セール・宣伝でよく出てくる単語
     "セール", "クーポン", "キャンペーン", "プレゼント", "ギフト", "スペシャル",
     "リミテッド", "シーズン", "トレンド", "サマー", "ウィンター",
+    # 素材・形・色・装飾など、ブランド名ではない一般的なカタカナ
+    "ナイロン", "ポリエステル", "フリース", "ボア", "ロゴ", "ダウン", "ジャージ", "ウェア",
+    "ロング", "ショート", "ハーフ", "ミニ", "ビッグ", "オーバーサイズ", "スリム", "ワイド",
+    "ホワイト", "ブラック", "ネイビー", "グレー", "グリーン", "ブルー", "レッド", "ベージュ",
+    "ブラウン", "ピンク", "イエロー", "オレンジ", "パープル", "カーキ", "アイボリー", "シルバー",
+    "ゴールド", "ベーシック", "カジュアル", "オリジナル", "レディース", "メンズ", "ユニセックス",
+    "フード", "ジップ", "ポケット", "ボタン", "プリント", "ストライプ", "チェック", "ライン",
 }
 
 
@@ -919,7 +958,7 @@ def _looks_brand_like(tok: str, *, allow_katakana: bool = True) -> bool:
     if any(c.isdigit() for c in tok):
         return False
     if _LATIN_TOKEN_RE.fullmatch(tok):
-        return True
+        return len(tok) >= 3
     if allow_katakana and _KATAKANA_TOKEN_RE.fullmatch(tok) and tok not in _KATAKANA_STOPWORDS:
         return True
     return False
@@ -1108,15 +1147,38 @@ WATCHLIST_COLUMNS = [
 ]
 
 
+def _watchlist_key(row: dict) -> tuple:
+    """候補リストで「同じもの」と判定するための組み合わせ。同じ出品者でもブランドが違えば別の行として保存する。"""
+    return (
+        row.get("プロフィールURL") or row.get("一覧URL") or row.get("出品者名") or "",
+        (row.get("ブランド名") or "").strip().lower(),
+        row.get("一覧URL") or "",
+    )
+
+
 def add_to_watchlist(row: dict):
-    """候補リスト（st.session_state）に1行追加する。同じ「一覧URL」が既にあれば上書きする。"""
+    """候補リスト（st.session_state）に1行追加する。出品者・ブランド・一覧URLがすべて同じものが既にあれば上書きする。"""
     wl = st.session_state.setdefault("watchlist", [])
-    key = row.get("一覧URL")
+    key = _watchlist_key(row)
     for i, existing in enumerate(wl):
-        if key and existing.get("一覧URL") == key:
+        if _watchlist_key(existing) == key:
             wl[i] = row
             return
     wl.append(row)
+
+
+def import_watchlist_csv(uploaded) -> int:
+    """前回ダウンロードした候補リストのCSVを読み込み、今のリストに合流させる。読み込んだ行数を返す。"""
+    df = pd.read_csv(uploaded, encoding="utf-8-sig").fillna("")
+    count = 0
+    for rec in df.to_dict("records"):
+        if not rec.get("出品者名") and not rec.get("プロフィールURL"):
+            continue  # スプレッドシートに貼り付けた際に混ざった空行・ヘッダー行などは飛ばす
+        if rec.get("追加日時") == "追加日時":
+            continue
+        add_to_watchlist({c: rec.get(c, "") for c in WATCHLIST_COLUMNS})
+        count += 1
+    return count
 
 
 def render_sourcing_row(it: dict, brand: str):
@@ -1683,7 +1745,11 @@ def render_seller_tool():
             "一覧URL": res.get("brand_url") or "",
             "プロフィールURL": res.get("profile_url") or "",
         })
-        st.success("候補リストに追加しました。「📒 ブランド候補リスト」タブから確認・ダウンロードできます。")
+        st.success(
+            f"候補リストに追加しました（現在 {len(st.session_state['watchlist'])} 件）。"
+            "「📒 ブランド候補リスト」タブでCSVをダウンロードして保存してください。"
+            "ブラウザを閉じるとリストは消えます。"
+        )
 
     # ---------------------------------------------------------------- 3
     st.divider()
@@ -2223,17 +2289,26 @@ def render_price_tool():
             "通関手数料（円・任意）", min_value=0, value=0, step=100, key="clearance_fee",
             help="利用する配送会社・転送会社によって発生する通関手数料です（無ければ0のままでOK）。",
         )
-    duty2_raw = taxable_value2 * (duty_rate_pct / 100)
-    duty2 = int(duty2_raw // 100) * 100  # 関税額は100円未満切り捨て
-    consumption_tax2 = (taxable_value2 + duty2) * 0.10
+    # 関税率が未入力（0%）かつカテゴリー未選択のときは、関税・消費税は計算しない（通関手数料だけ入力されていればそれのみ加算）
+    calc_customs = duty_rate_pct > 0 or selected_cat is not None
+    if calc_customs:
+        duty2_raw = taxable_value2 * (duty_rate_pct / 100)
+        duty2 = int(duty2_raw // 100) * 100  # 関税額は100円未満切り捨て
+        consumption_tax2 = (taxable_value2 + duty2) * 0.10
+    else:
+        duty2 = 0
+        consumption_tax2 = 0
     customs2 = duty2 + consumption_tax2 + clearance_fee2
-    if duty_rate_pct > 0:
+    if calc_customs:
         st.caption(
             f"課税価格 {yen(taxable_value2)} → 関税 {yen(duty2)} ＋ 消費税 {yen(consumption_tax2)} "
             f"＋ 通関手数料 {yen(clearance_fee2)} ＝ **関税・消費税の合計 {yen(customs2)}**"
         )
     else:
-        st.caption("関税率を入力すると、ここに関税・消費税の合計が表示されます（0%のままなら0円として計算します）。")
+        st.caption(
+            "関税・消費税は計算していません（0円）。計算するには、商品カテゴリーを選ぶか関税率を入力してください。"
+            f"通関手数料のみ入力した場合は {yen(clearance_fee2)} が加算されます。"
+        )
 
     st.markdown("**④ 国内送料・その他経費**")
     st.selectbox(
@@ -2318,8 +2393,23 @@ def render_price_tool():
 def render_watchlist_tool():
     st.title("📒 ブランド候補リスト")
     st.write("**「🔎 出品者チェック」で気になった出品者を保存しておく場所です。**")
-    st.caption("このリストはブラウザを閉じると消えます。")
-    st.caption("あとで見返したいときは、CSVでダウンロードしてGoogleスプレッドシートやエクセルに保存してください。")
+    st.warning(
+        "このリストは**ブラウザを閉じる・しばらく放置すると消えます**。"
+        "毎回、下の「CSVでダウンロード」で保存してください。"
+        "後日あらためて追加するときは、先に「前回のCSVを読み込む」で前回の分を戻すと、続きから溜められます。"
+    )
+
+    with st.expander("📂 前回のCSVを読み込む（続きから追加したいとき）", expanded=not st.session_state.get("watchlist")):
+        uploaded = st.file_uploader("前回ダウンロードした「buyma_候補リスト.csv」を選んでください", type="csv", key="watchlist_upload")
+        if uploaded is not None:
+            done = st.session_state.setdefault("watchlist_imported_ids", [])
+            if uploaded.file_id not in done:
+                try:
+                    n = import_watchlist_csv(uploaded)
+                    done.append(uploaded.file_id)
+                    st.success(f"{n}件を読み込みました。")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"CSVを読み込めませんでした（{e}）。ダウンロードしたCSVをそのまま選んでください。")
 
     wl = st.session_state.get("watchlist") or []
     if not wl:
