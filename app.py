@@ -3664,6 +3664,24 @@ _TLD_VAT_COUNTRY = {
 }
 
 
+def _recalc_row_price(idx: int, price_key: str, cur_key: str):
+    """STEP 6で、価格や通貨を直したら、日本円への換算をやり直して、リストの該当行に書き戻す。"""
+    rows = st.session_state.get("sourcing_list") or []
+    if not (0 <= idx < len(rows)):
+        return
+    row = rows[idx]
+    cur = st.session_state.get(cur_key) or row.get("通貨")
+    try:
+        amt = float(st.session_state.get(price_key))
+    except (TypeError, ValueError):
+        return
+    if amt <= 0 or not cur:
+        return
+    fx = (1.0, None) if cur == "JPY" else fetch_fx_rate(cur)
+    row["現地価格"], row["通貨"] = amt, cur
+    row["円換算"] = int(round(amt * fx[0])) if fx else ""
+
+
 def _set_vat_country(idx: int, country_key: str, rate_key: str):
     """国を選んだら、その国の税率をVAT率の欄と、リストの該当行に入れる。"""
     name = st.session_state.get(country_key)
@@ -4152,7 +4170,7 @@ def _render_candidates(cands: list, item_now: dict):
         "🇺🇸 VATなし（抜けません）" if str(c) == "USD" else v for v, c in zip(cdf["VAT表示"], cdf["通貨"])
     ]  # アメリカのサイト（ドル表示）は、VATがないので抜けない（表示だけの変更。保存データは変えない）
     cdf["手入力の価格"] = float("nan")
-    cdf["手入力の通貨"] = [_guess_currency(u) for u in cdf["仕入れ先URL"]]
+    cdf["手入力の通貨"] = [(c if c in _CURRENCY_CHOICES else _guess_currency(u)) for u, c in zip(cdf["仕入れ先URL"], cdf["通貨"].fillna("").astype(str))]
     show_cols = ["追加", "種類", "仕入れ先サイト", "仕入れ先商品名", "現地の価格", "手入力の価格", "手入力の通貨", "円換算"]
     if buyma_price:
         cdf["BUYMA売価"] = buyma_price
@@ -4188,18 +4206,32 @@ def _render_candidates(cands: list, item_now: dict):
             "仕入れ先URL": st.column_config.LinkColumn("商品ページ", display_text="🔗 開く"),
         },
     )
-    typed = picked_df[picked_df["手入力の価格"].fillna(0) > 0]
-    if len(typed):
-        by_u = {c["仕入れ先URL"]: c for c in st.session_state["src_candidates"]}
-        for _, tr in typed.iterrows():
-            base = by_u.get(tr["仕入れ先URL"])
-            if base:
-                by_u[tr["仕入れ先URL"]] = fill_supplier_price(base, float(tr["手入力の価格"]), tr["手入力の通貨"] or _guess_currency(tr["仕入れ先URL"]))
+    by_u = {c["仕入れ先URL"]: c for c in st.session_state["src_candidates"]}
+    changed = 0
+    for _, tr in picked_df.iterrows():
+        base = by_u.get(tr["仕入れ先URL"])
+        if not base:
+            continue
+        new_cur = tr["手入力の通貨"] or _guess_currency(tr["仕入れ先URL"])
+        typed_price = tr["手入力の価格"]
+        new_row = None
+        if pd.notna(typed_price) and float(typed_price) > 0:  # 価格を手入力した
+            new_row = fill_supplier_price(base, float(typed_price), new_cur)
+        elif base.get("通貨") and new_cur != base.get("通貨") and str(base.get("現地価格") or "").strip() not in ("", "nan"):
+            # 通貨だけ直した（例：ドルと読まれたが、実際はポンド）→ 同じ金額で、通貨を変えて換算し直す
+            new_row = fill_supplier_price(base, float(base["現地価格"]), new_cur)
+        if new_row is not None:
+            if base.get("VAT表示") not in ("", None, "不明"):  # ページから判定できていたVATの情報は残す
+                for k in ("VAT表示", "VAT率", "VAT根拠"):
+                    new_row[k] = base.get(k, "")
+            by_u[tr["仕入れ先URL"]] = new_row
+            changed += 1
+    if changed:
         st.session_state["src_candidates"] = list(by_u.values())
         st.session_state["src_cand_ver"] = ver + 1
-        st.session_state["src_fix_msg"] = f"{len(typed)}件の価格を反映しました。"
+        st.session_state["src_fix_msg"] = f"{changed}件の価格・通貨を反映しました。"
         st.rerun()
-    st.caption("✏️ 読めなかった行は、「価格を手入力」をダブルクリックして入力（先に「通貨」を確認）")
+    st.caption("✏️ 読めなかった行は「価格を手入力」へ。通貨が違うときは、「通貨」を直す（例：USD → GBP）")
     chosen = picked_df[picked_df["追加"]]["仕入れ先URL"].tolist()
     b1, b2 = st.columns([3, 1])
     with b1:
@@ -4302,6 +4334,26 @@ def _render_sourcing_list_and_detail(rows: list):
             st.caption(stock or "取得できず")
         if r.get("現地価格") not in ("", None):
             st.markdown(f"**価格**：{r.get('現地価格')} {r.get('通貨')}（約{yen(r['円換算']) if r.get('円換算') not in ('', None) else '円換算できず'}）")
+            _pt = hashlib.md5(str(r.get("仕入れ先URL") or idx).encode()).hexdigest()[:8]
+            pc1, pc2 = st.columns([3, 2])
+            _cur_now = str(r.get("通貨") or "")
+            _choices = _CURRENCY_CHOICES if _cur_now in _CURRENCY_CHOICES or not _cur_now else _CURRENCY_CHOICES + [_cur_now]
+            with pc1:
+                try:
+                    _amt_now = float(r.get("現地価格"))
+                except (TypeError, ValueError):
+                    _amt_now = 0.0
+                st.number_input(
+                    "価格（現地の金額）", min_value=0.0, value=_amt_now, step=1.0, key=f"src_price_{_pt}",
+                    on_change=_recalc_row_price, args=(idx, f"src_price_{_pt}", f"src_cur_{_pt}"),
+                    help="ページと違うときは、ここで直せます。日本円を計算し直します。",
+                )
+            with pc2:
+                st.selectbox(
+                    "通貨", _choices, index=_choices.index(_cur_now) if _cur_now in _choices else 0, key=f"src_cur_{_pt}",
+                    on_change=_recalc_row_price, args=(idx, f"src_price_{_pt}", f"src_cur_{_pt}"),
+                    help="ポンド（GBP）・ユーロ（EUR）・ドル（USD）などを選べます。選ぶと日本円を計算し直します。",
+                )
     with d2:
         st.markdown("**連絡先**")
         for ph in [p for p in str(r.get("電話") or "").split(" / ") if p]:
