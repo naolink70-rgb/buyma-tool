@@ -4231,7 +4231,38 @@ def _render_candidates(cands: list, item_now: dict):
         st.session_state["src_cand_ver"] = ver + 1
         st.session_state["src_fix_msg"] = f"{changed}件の価格・通貨を反映しました。"
         st.rerun()
-    st.caption("✏️ 読めなかった行は「価格を手入力」へ。通貨が違うときは、「通貨」を直す（例：USD → GBP）")
+    st.caption("✏️ 読めなかった行は、表の「価格を手入力」へ。")
+    # 通貨の直し方（表の中のセルが操作しづらい人向けに、ふつうの選択欄も用意する）
+    cur_list = st.session_state["src_candidates"]
+    st.markdown("**💱 通貨を直す**（ドルと出ていても、実際はポンドのときなど）")
+    q1, q2, q3, q4 = st.columns([4, 2, 2, 2])
+    with q1:
+        fix_idx = st.selectbox(
+            "どのショップ？", range(len(cur_list)), key=f"src_curfix_shop_{ver}",
+            format_func=lambda i: f"{cur_list[i].get('仕入れ先サイト')}｜{str(cur_list[i].get('仕入れ先商品名') or '')[:22]}｜{cur_list[i].get('現地価格')} {cur_list[i].get('通貨')}",
+        )
+    with q2:
+        fix_cur = st.selectbox("正しい通貨", ["（選ぶ）"] + _CURRENCY_CHOICES, key=f"src_curfix_cur_{ver}")
+    with q3:
+        fix_price = st.number_input("価格も直すとき（空なら0）", min_value=0.0, step=1.0, key=f"src_curfix_price_{ver}")
+    with q4:
+        st.write("")
+        st.write("")
+        if st.button("計算し直す", key=f"src_curfix_go_{ver}", use_container_width=True):
+            base = cur_list[fix_idx]
+            amt = float(fix_price) if fix_price > 0 else (float(base["現地価格"]) if str(base.get("現地価格") or "").strip() not in ("", "nan") else 0.0)
+            cur = fix_cur if fix_cur != "（選ぶ）" else (base.get("通貨") or "")
+            if amt > 0 and cur:
+                new_row = fill_supplier_price(base, amt, cur)
+                if base.get("VAT表示") not in ("", None, "不明"):
+                    for k in ("VAT表示", "VAT率", "VAT根拠"):
+                        new_row[k] = base.get(k, "")
+                st.session_state["src_candidates"] = [new_row if x["仕入れ先URL"] == base["仕入れ先URL"] else x for x in cur_list]
+                st.session_state["src_cand_ver"] = ver + 1
+                st.session_state["src_fix_msg"] = f"{base.get('仕入れ先サイト')}：{amt:,.2f} {cur} で計算し直しました。"
+                st.rerun()
+            else:
+                st.warning("価格か通貨を入れてください。")
     chosen = picked_df[picked_df["追加"]]["仕入れ先URL"].tolist()
     b1, b2 = st.columns([3, 1])
     with b1:
