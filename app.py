@@ -13,11 +13,14 @@ import re
 import statistics
 import datetime as dt
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+import threading
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, urljoin, quote_plus, quote
 
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="BUYMA 出品者チェックツール", page_icon="🛍️", layout="wide")
@@ -97,10 +100,31 @@ st.markdown(
     /* セレクトボックス・数値入力は、初期状態だと枠線の色が背景色と同じで見分けづらいため、
        はっきりした枠線と白背景を付けて他の背景から浮き立たせる。 */
     [data-testid="stSelectbox"] [data-baseweb="select"] > div,
-    [data-testid="stNumberInputContainer"] {
+    [data-testid="stMultiSelect"] [data-baseweb="select"] > div,
+    [data-testid="stNumberInputContainer"],
+    [data-testid="stTextInput"] [data-baseweb="input"],
+    [data-testid="stTextInput"] [data-baseweb="base-input"],
+    [data-testid="stTextArea"] [data-baseweb="textarea"],
+    [data-testid="stTextArea"] [data-baseweb="base-input"] {
         background-color: #FFFFFF !important;
-        border: 1.5px solid #F2795C !important;
+        border: 2px solid #E8664A !important;
         border-radius: 8px !important;
+    }
+    /* 文字を入れる欄（URLなどを貼る場所）は、中の入力部分も白にして、貼った文字を濃く見せる */
+    [data-testid="stTextInput"] input,
+    [data-testid="stTextArea"] textarea,
+    [data-testid="stNumberInput"] input {
+        background-color: #FFFFFF !important;
+        color: #2B1F1B !important;
+    }
+    [data-testid="stTextInput"] input::placeholder,
+    [data-testid="stTextArea"] textarea::placeholder {
+        color: #A89690 !important;
+    }
+    [data-testid="stTextInput"] [data-baseweb="input"]:focus-within,
+    [data-testid="stTextArea"] [data-baseweb="textarea"]:focus-within {
+        border-color: #C2410C !important;
+        box-shadow: 0 0 0 3px rgba(242, 121, 92, 0.25) !important;
     }
     [data-testid="stRadio"] {
         background-color: rgba(255, 255, 255, 0.5) !important;
@@ -458,6 +482,48 @@ def order_matches_brand(order: dict, brand: str) -> bool:
         return False
     hay = ((order.get("name") or "") + " " + (order.get("text") or "")).lower()
     return brand.strip().lower() in hay
+
+
+def _gender_from_breadcrumb(html: str) -> str:
+    """商品ページのパンくず（BreadcrumbList）から「メンズ」「レディース」「キッズ」を読み取る。"""
+    for blob in re.findall(r'<script[^>]*application/ld\+json[^>]*>(.*?)</script>', html or "", re.S):
+        try:
+            d = json.loads(blob)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(d, dict) and d.get("@type") == "BreadcrumbList":
+            for it in d.get("itemListElement", []):
+                n = it.get("name") or (it.get("item") or {}).get("name") or ""
+                if n.startswith("メンズ"):
+                    return "メンズ"
+                if n.startswith("レディース"):
+                    return "レディース"
+                if n.startswith("ベビー") or n.startswith("キッズ"):
+                    return "キッズ"
+    return "不明"
+
+
+def _gender_from_name(name: str) -> str:
+    """商品ページを見られなかった（出品終了など）ときの代わりに、商品名の「Men's」「Women's」などから推定する。"""
+    n = name or ""
+    if re.search(r"レディース|ウィメンズ|ウーマン|\bwomen'?s?\b|\bwomens\b|\bladies\b|\bwmns\b", n, re.I):
+        return "レディース"
+    if re.search(r"メンズ|\bmen'?s?\b|\bmens\b", n, re.I):
+        return "メンズ"
+    return "不明"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_item_genders(item_ids: tuple) -> dict:
+    """売れた商品のIDから、商品ページのカテゴリー（メンズ／レディース）をまとめて調べる。出品終了で見られないものは「不明」。"""
+    def one(i):
+        try:
+            r = requests.get(f"https://www.buyma.com/item/{i}/", headers=HEADERS, timeout=15)
+            return i, (_gender_from_breadcrumb(r.text) if r.status_code == 200 else "不明")
+        except Exception:  # noqa: BLE001
+            return i, "不明"
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return dict(ex.map(one, item_ids))
 
 
 def check_item_sold(seller_id: str, item_id: str, max_pages: int = 5):
@@ -1222,6 +1288,52 @@ def render_sourcing_row(it: dict, brand: str):
 
 
 # ============================ 画面：① 出品者チェック ============================
+_GCOL = {  # 見出しの色：(背景, 文字, 本文のうすい色)
+    "total": ("#FFE8D1", "#C2410C", "#FFF8F0"),
+    "men": ("#DBEAFE", "#1D4ED8", "#F3F8FF"),
+    "women": ("#FCE7F3", "#BE185D", "#FFF3F9"),
+    "unknown": ("#EDEDF0", "#4B5563", "#F8F8FA"),
+    "plain": ("#F6E3DC", "#6B4A40", "#FFFFFF"),
+}
+
+
+def gender_cards_html(items: list) -> str:
+    """合計・メンズ・レディースなどを、同じ大きさの色つきカードで並べる。items=[(ラベル, 数字, 色キー)]"""
+    import html as _h
+    cards = ""
+    for label, val, key in items:
+        bg, fg, tint = _GCOL[key]
+        cards += (
+            f'<div style="flex:1 1 0;min-width:0;border:1.5px solid {fg}33;border-radius:12px;background:{tint};padding:10px 12px;">'
+            f'<div style="display:inline-block;background:{bg};color:{fg};font-weight:700;font-size:0.85rem;padding:2px 10px;border-radius:999px;">{_h.escape(label)}</div>'
+            f'<div style="font-size:1.9rem;font-weight:600;color:#4A3B36;margin-top:4px;">{val:,}<span style="font-size:1rem;"> 件</span></div></div>'
+        )
+    return f'<div style="display:flex;gap:10px;margin:6px 0 14px 0;">{cards}</div>'
+
+
+def gender_table_html(columns: list, rows: list) -> str:
+    """列の幅をそろえた、見出しに色つきの表。columns=[(列名, 色キー, 幅%)]"""
+    import html as _h
+    cg = "".join(f'<col style="width:{w}%">' for _, _, w in columns)
+    th = "".join(
+        f'<th style="background:{_GCOL[k][0]};color:{_GCOL[k][1]};padding:8px 6px;text-align:center;font-weight:700;border:1px solid #F0A98C55;">{_h.escape(n)}</th>'
+        for n, k, _ in columns
+    )
+    body = ""
+    for r in rows:
+        tds = ""
+        for (n, k, _), v in zip(columns, r):
+            tds += (
+                f'<td style="background:{_GCOL[k][2]};padding:6px;text-align:center;border:1px solid #F0A98C33;'
+                f'color:{"#B5A39C" if v == 0 else "#4A3B36"};">{_h.escape(str(v))}</td>'
+            )
+        body += f"<tr>{tds}</tr>"
+    return (
+        f'<table style="width:100%;table-layout:fixed;border-collapse:collapse;border-radius:10px;overflow:hidden;">'
+        f"<colgroup>{cg}</colgroup><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+    )
+
+
 def render_seller_tool():
     st.title("🛍️ BUYMA 出品者チェックツール")
     st.write(
@@ -1492,10 +1604,40 @@ def render_seller_tool():
                 "現在は全ブランド合計の実績です（このブランドだけの数字ではありません）。"
             )
 
+    is_brand_specific = use_orders is brand_orders
+    _all_orders_g, _g = None, None
+    if use_orders and is_brand_specific:
+        _all_orders_g = list(use_orders)  # 性別の内訳（合計・メンズ・レディース）は、絞り込む前の全件で数える
+        with st.spinner("売れた商品のメンズ／レディースを調べています…（初回だけ少し時間がかかります）"):
+            genders = fetch_item_genders(tuple(sorted({o["item_id"] for o in use_orders if o.get("item_id")})))
+
+        def _g(o):
+            g = genders.get(o.get("item_id"), "不明")
+            return g if g != "不明" else _gender_from_name(o.get("name") or "")
+
+        gender_pick = st.radio(
+            "性別（メンズ／レディース）で絞り込む", ["すべて", "メンズ", "レディース"], key="order_gender", horizontal=True,
+            help=(
+                "注文実績のページ自体にはメンズ・レディースの区別がないため、売れた商品1つ1つの商品ページを調べて分類しています。"
+                "すでに出品が終わった商品は商品ページが見られないので、商品名の「Men's」「Women's」などから判断し、"
+                "それでも分からないものは絞り込み時に除かれます。"
+            ),
+        )
+        if gender_pick != "すべて":
+            total_before = len(use_orders)
+            unknown_n = sum(1 for o in use_orders if _g(o) == "不明")
+            use_orders = [o for o in use_orders if _g(o) == gender_pick]
+            relevant_orders = use_orders  # 下の「実際に売れた商品」の一覧も、同じ性別にしぼる
+            st.caption(
+                f"「{gender_pick}」の注文実績にしぼり込んでいます（{len(use_orders)}件 / このブランド全体{total_before}件中）。"
+                f"男女を判別できなかった{unknown_n}件（出品終了で商品ページが見られず、商品名にも手がかりがないもの）は含まれていません。"
+                "なお、下の月ごとの表の「出品数」は、性別では絞り込まれません。"
+            )
+
     if not use_orders:
-        st.info("公開されている注文実績が見つかりませんでした。実績がまだ少ない出品者か、注文実績を公開していない可能性があります。")
+        st.info("公開されている注文実績が見つかりませんでした。実績がまだ少ない出品者か、注文実績を公開していない可能性があります。"
+                "（性別で絞り込んでいる場合は、「すべて」に戻すと表示されることがあります）")
     else:
-        is_brand_specific = use_orders is brand_orders
         dates = [o["date"] for o in use_orders]
         first_sale, last_sale = dates[0], dates[-1]
         months = month_span(first_sale, last_sale)
@@ -1543,15 +1685,45 @@ def render_seller_tool():
             )
 
         if is_brand_specific:
+            if _all_orders_g and _g:
+                gc = Counter(_g(o) for o in _all_orders_g)
+                st.markdown("**売れた件数の内訳（注文実績）**")
+                st.markdown(
+                    gender_cards_html([
+                        ("合計", len(_all_orders_g), "total"),
+                        ("メンズ", gc.get("メンズ", 0), "men"),
+                        ("レディース", gc.get("レディース", 0), "women"),
+                        ("判別できず", len(_all_orders_g) - gc.get("メンズ", 0) - gc.get("レディース", 0), "unknown"),
+                    ]),
+                    unsafe_allow_html=True,
+                )
             st.markdown("**月ごとの数字（新しい月が上）**")
             all_months = sorted(set(listing_months) | set(months), reverse=True)
-            month_table = pd.DataFrame({
+            tbl = {
                 "日付": [jp_month(k) for k in all_months],
                 "ブランド名": [brand] * len(all_months),
                 "出品数": [listing_monthly.get(k, 0) for k in all_months],
                 "販売数": [monthly.get(k, 0) for k in all_months],
-            })
-            st.table(month_table.set_index("日付"))
+            }
+            if _all_orders_g and _g:
+                by_m = {}
+                for o in _all_orders_g:
+                    by_m.setdefault(month_key(o["date"]), Counter())[_g(o)] += 1
+                tbl["販売数（メンズ）"] = [by_m.get(k, Counter()).get("メンズ", 0) for k in all_months]
+                tbl["販売数（レディース）"] = [by_m.get(k, Counter()).get("レディース", 0) for k in all_months]
+                tbl["判別できず"] = [
+                    sum(v for kk, v in by_m.get(k, Counter()).items() if kk not in ("メンズ", "レディース")) for k in all_months
+                ]
+            if "販売数（メンズ）" in tbl:
+                cols_def = [("日付", "plain", 13), ("ブランド名", "plain", 17), ("出品数", "plain", 14), ("販売合計", "total", 14),
+                            ("メンズ販売", "men", 14), ("レディース販売", "women", 14), ("判別できず", "unknown", 14)]
+                keys = ["日付", "ブランド名", "出品数", "販売数", "販売数（メンズ）", "販売数（レディース）", "判別できず"]
+                st.markdown(
+                    gender_table_html(cols_def, [[tbl[k][i] for k in keys] for i in range(len(tbl["日付"]))]),
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.table(pd.DataFrame(tbl).set_index("日付"))
         else:
             st.caption(
                 "💡 特定ブランドの絞り込みができていないため、この下の「よく売れているブランド」ランキングと"
@@ -1796,13 +1968,24 @@ def render_seller_tool():
         seen_ids.add(o["item_id"])
         sold_items.append({
             "name": o.get("name") or "（商品名不明）", "image": o["image"], "url": o["url"],
-            "price": None, "listed_on": None, "sold_on": o["date"],
+            "price": None, "listed_on": None, "sold_on": o["date"], "item_id": o["item_id"],
         })
     sold_items.sort(key=lambda x: x["sold_on"], reverse=True)
 
     if sold_items:
         st.subheader("✅ 実際に売れた商品から探す（おすすめ）")
-        st.caption("すでに売れた実績がある商品です。仕入れ先を探す優先度が高いのはこちらです。")
+        _gp = st.session_state.get("order_gender", "すべて")
+        st.caption(
+            "すでに売れた実績がある商品です。仕入れ先を探す優先度が高いのはこちらです。"
+            + (f"（上の「{_gp}」の絞り込みが反映されています）" if _gp != "すべて" else "　商品名の前の【メンズ】【レディース】は、商品ページから判定しています。")
+        )
+        _gmap = fetch_item_genders(tuple(it["item_id"] for it in sold_items[:LIMIT]))
+        for it in sold_items[:LIMIT]:
+            g = _gmap.get(it["item_id"], "不明")
+            if g == "不明":
+                g = _gender_from_name(it["name"])
+            if g in ("メンズ", "レディース"):
+                it["name"] = f"【{g}】{it['name']}"
         with st.spinner("売れた商品の写真を確認しています…"):
             for it in sold_items[:LIMIT]:
                 render_sourcing_row(it, brand)
@@ -2444,16 +2627,1887 @@ def render_watchlist_tool():
             st.rerun()
 
 
+# ============================ 画面：③ 仕入れ先リサーチ ============================
+SOURCING_COLUMNS = [
+    "交渉済み", "追加日時", "BUYMA商品名", "BUYMA売価", "仕入れ先サイト", "種類", "仕入れ先商品名",
+    "現地価格", "通貨", "円換算", "VAT表示", "VAT率", "VAT根拠", "在庫（サイズ別）", "電話", "メール", "問い合わせページ",
+    "仕入れ先URL", "BUYMA商品URL", "メモ", "リンク集", "ショップ情報",
+]
+
+# 各国のGoogleの窓口（ドメイン, 言語, 国コード）。検索結果は、その国向けの表示になる。
+_SEARCH_COUNTRIES = {
+    "🇺🇸 アメリカ": ("google.com", "en", "US"),
+    "🇬🇧 イギリス": ("google.co.uk", "en", "GB"),
+    "🇮🇹 イタリア": ("google.it", "it", "IT"),
+    "🇫🇷 フランス": ("google.fr", "fr", "FR"),
+    "🇩🇪 ドイツ": ("google.de", "de", "DE"),
+    "🇪🇸 スペイン": ("google.es", "es", "ES"),
+    "🇰🇷 韓国": ("google.co.kr", "ko", "KR"),
+    "🇦🇺 オーストラリア": ("google.com.au", "en", "AU"),
+    "🇨🇦 カナダ": ("google.ca", "en", "CA"),
+    "🇯🇵 日本": ("google.co.jp", "ja", "JP"),
+}
+
+_JP_CHARS_RE = re.compile(r"[぀-ヿ一-鿿＀-￯・]+")
+_CONTACT_WORDS = (
+    "contact", "support", "customer", "help", "faq", "service-client", "kontakt", "contatti",
+    "contacto", "お問い合わせ", "お問合せ", "問い合わせ", "문의",
+)
+_MODEL_STOP_RE = re.compile(r"^(?:20\d{2}(?:ss|aw|fw|pf)?|\d{1,3}(?:cm|mm|g|kg|ml|l)|w\d{2}|h\d{2})$", re.I)
+
+
+def guess_model_candidates(*texts: str, limit: int = 8) -> list:
+    """商品名・説明文から、型番っぽい文字列を複数拾う（本当の型番かは分からないので、候補として全部出す）。
+    例：「PR 17ZS」「0PR 17ZS」「1BA252」「GG0061S」。"""
+    text = " ".join(t for t in texts if t)
+    # URL・メールアドレス・「〜.com/〜」のような文字列は型番ではないので先に取り除く
+    text = re.sub(r"https?://\S+|\b[\w.\-]+\.(?:com|jp|net|org|html?)\S*|\S+@\S+", " ", text)
+    cands = []
+
+    def add(tok):
+        tok = tok.strip(" -_./")
+        if len(tok) < 4 or _MODEL_STOP_RE.match(tok):
+            return
+        if not any(c.isdigit() for c in tok) or "/" in tok:
+            return
+        if tok not in cands and not any(tok in c for c in cands):
+            cands.append(tok)
+
+    # 「0PR 17ZS」のように、スペースで区切られた型番
+    for m in re.finditer(r"\b([0-9]?[A-Z]{1,4}\s\d{2,4}[A-Z0-9]{0,4})\b", text):
+        add(m.group(1))
+    for m in re.finditer(r"[A-Za-z0-9][A-Za-z0-9\-_./]{3,}", text):
+        add(m.group(0))
+    return cands[:limit]
+
+
+# ---- 日本語→英語（検索ワード用）。まず辞書で変換し、残った日本語だけ無料の翻訳(MyMemory)に任せる ----
+_JA_EN_GLOSSARY = [
+    ("メンズ", "men's"), ("レディース", "women's"), ("ユニセックス", "unisex"), ("キッズ", "kids"),
+    ("スウェットパンツ", "sweatpants"), ("スウェット", "sweatshirt"), ("パーカー", "hoodie"), ("フーディー", "hoodie"),
+    ("フーディ", "hoodie"), ("トレーナー", "sweatshirt"), ("Tシャツ", "t-shirt"), ("ポロシャツ", "polo shirt"),
+    ("シャツ", "shirt"), ("ブラウス", "blouse"), ("ニット", "knit"), ("セーター", "sweater"), ("カーディガン", "cardigan"),
+    ("ジャケット", "jacket"), ("ブルゾン", "bomber jacket"), ("ジャンバー", "jacket"), ("コート", "coat"), ("ダウン", "down jacket"),
+    ("トラックパンツ", "track pants"), ("パンツ", "pants"), ("デニム", "denim"), ("ジーンズ", "jeans"), ("ショートパンツ", "shorts"),
+    ("ハーフパンツ", "shorts"), ("スカート", "skirt"), ("ワンピース", "dress"), ("レギンス", "leggings"), ("タンクトップ", "tank top"),
+    ("トートバッグ", "tote bag"), ("ショルダーバッグ", "shoulder bag"), ("ハンドバッグ", "handbag"), ("リュック", "backpack"),
+    ("バックパック", "backpack"), ("バッグ", "bag"), ("ポーチ", "pouch"), ("財布", "wallet"), ("長財布", "long wallet"),
+    ("キーケース", "key case"), ("カードケース", "card case"), ("ベルト", "belt"), ("サングラス", "sunglasses"), ("メガネ", "glasses"),
+    ("ネックレス", "necklace"), ("ブレスレット", "bracelet"), ("ピアス", "earrings"), ("イヤリング", "earrings"), ("リング", "ring"),
+    ("指輪", "ring"), ("時計", "watch"), ("腕時計", "watch"), ("スニーカー", "sneakers"), ("ブーツ", "boots"), ("サンダル", "sandals"),
+    ("ローファー", "loafers"), ("パンプス", "pumps"), ("シューズ", "shoes"), ("靴下", "socks"), ("ソックス", "socks"),
+    ("マフラー", "scarf"), ("ストール", "stole"), ("スカーフ", "scarf"), ("手袋", "gloves"), ("グローブ", "gloves"),
+    ("キャップ", "cap"), ("帽子", "hat"), ("ハット", "hat"), ("ビーニー", "beanie"), ("ヘアゴム", "scrunchie"),
+    ("ブラック", "black"), ("ホワイト", "white"), ("ネイビー", "navy"), ("グレー", "gray"), ("ベージュ", "beige"),
+    ("ブラウン", "brown"), ("グリーン", "green"), ("ブルー", "blue"), ("レッド", "red"), ("ピンク", "pink"), ("黒", "black"), ("白", "white"),
+    ("ロゴ", "logo"), ("刺繍", "embroidered"), ("ダメージ加工", "distressed"), ("オーバーサイズ", "oversized"),
+    ("セットアップ", "set"), ("ジップ", "zip"), ("半袖", "short sleeve"), ("長袖", "long sleeve"), ("レザー", "leather"),
+    ("本革", "leather"), ("ウール", "wool"), ("カシミヤ", "cashmere"), ("デザイン", "design"),
+]
+_JA_EN_GLOSSARY.sort(key=lambda kv: -len(kv[0]))
+_JA_RUN_RE = re.compile(r"[぀-ヿ一-鿿＀-￯ー・]+")
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _translate_free(text: str) -> str:
+    """辞書で訳せなかった日本語だけを、無料の翻訳サービス（MyMemory・キー不要）で英語にする。失敗したら空文字。"""
+    try:
+        r = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text, "langpair": "ja|en"}, timeout=12,
+        )
+        d = r.json()
+        if d.get("responseStatus") == 200 and not d.get("quotaFinished"):
+            out = (d.get("responseData") or {}).get("translatedText") or ""
+            return "" if _JA_RUN_RE.search(out) else out.strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def to_english(text: str) -> str:
+    """商品名などの日本語を英語に直す。英字（ブランド名・型番）はそのまま残す。"""
+    t = clean_name(text or "")
+    for ja, en in _JA_EN_GLOSSARY:
+        t = t.replace(ja, f" {en} ")
+    for run in set(_JA_RUN_RE.findall(t)):
+        if len(run) >= 2:
+            t = t.replace(run, f" {_translate_free(run)} ")
+        else:
+            t = t.replace(run, " ")
+    t = _JA_RUN_RE.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    seen, words = set(), []
+    for w in t.split(" "):  # 同じ単語の重複を除く（例：sweatpants sweatpants）
+        if w.lower() not in seen:
+            seen.add(w.lower())
+            words.append(w)
+    return " ".join(words)
+
+
+_MODEL_LABEL_RE = re.compile(
+    r"(?:品番|型番|商品番号|商品コード|モデル番号|モデルナンバー|スタイルナンバー|"
+    r"Model(?:\s*(?:No\.?|Number|code))?|Style(?:\s*(?:No\.?|Number|code))?|Ref(?:erence)?\.?|SKU|"
+    r"Item\s*(?:No\.?|Number)|Article(?:\s*(?:No\.?|Number))?|Product\s*code)"
+    r"\s*[:：#＃\-\s]\s*([A-Za-z0-9][A-Za-z0-9\-_./ ]{2,24}?)(?=\s*(?:[\n\r、。,;/）)】]|\s{2,}|$|[ぁ-んァ-ヶ一-龥]))",
+    re.I,
+)
+
+
+def extract_labeled_models(*texts: str) -> list:
+    """商品ページに「品番：」「型番：」「Model:」「Style No.」などと**書かれているものだけ**を拾う。"""
+    text = "\n".join(t for t in texts if t)
+    out = []
+    for m in _MODEL_LABEL_RE.finditer(text):
+        v = m.group(1).strip(" -_./")
+        if len(v) >= 3 and any(c.isdigit() for c in v) and v not in out:
+            out.append(v)
+    return out[:6]
+
+
+_PASTE_SKIP_DOMAINS = (
+    "google.", "gstatic.", "youtube.", "instagram.", "facebook.", "pinterest.", "twitter.", "x.com",
+    "tiktok.", "buyma.com", "wikipedia.", "line.me", "t.co",
+)
+
+
+def extract_urls_from_text(text: str) -> list:
+    """貼り付けられた文章から、商品ページっぽいURLを取り出す。
+    ふつうのURLに加えて、Googleの検索結果に表示される「サイト名 › products › 商品名」の形も、URLに直して拾う。"""
+    urls = []
+    for m in re.finditer(r"https?://[^\s<>\"'）)」】]+", text or ""):
+        rest = (text or "")[m.end():m.end() + 6]
+        if "›" in rest:  # 「サイト名 › products › 商品名」形式の先頭部分なので、下で組み立て直す
+            continue
+        urls.append(m.group(0).rstrip(".,;、。"))
+    for m in re.finditer(r"(?:https?://)?((?:[a-z0-9][a-z0-9\-]*\.)+[a-z]{2,})((?:\s*›\s*[^\s›]+)+)", text or "", re.I):
+        parts = [x.strip() for x in re.split(r"\s*›\s*", m.group(2)) if x.strip()]
+        if not parts or any(("…" in x or "..." in x) for x in parts):
+            continue
+        urls.append("https://" + m.group(1) + "/" + "/".join(parts))
+    out = []
+    for u in urls:
+        pu = urlparse(u)
+        host = pu.netloc.lower()
+        if not host or any(d in host for d in _PASTE_SKIP_DOMAINS) or pu.path in ("", "/"):
+            continue  # トップページ（商品ページではない）は除く
+        u = u.split("#")[0]
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def google_search_url(domain: str, hl: str, gl: str, query: str, shopping: bool = False) -> str:
+    q = quote_plus(query)
+    base = f"https://www.{domain}/search?q={q}&hl={hl}&gl={gl}&pws=0"
+    return base + ("&tbm=shop" if shopping else "")
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_buyma_item_info(url: str) -> dict:
+    """BUYMAの売れた商品ページから、タイトル・ブランド・売価・画像・説明文を読み取る。"""
+    html = fetch(url)
+    info = parse_buyma_product(html)
+    desc = ""
+    for node in _iter_jsonld(html):
+        if isinstance(node, dict) and node.get("@type") in ("Product", "ProductGroup") and node.get("description"):
+            desc = str(node["description"])
+            break
+    # BUYMA正式の商品名は「ブランド名＋カテゴリ」程度のことが多く、出品者が付けた英語の商品名・型番は
+    # パンくずリストの最後の項目に入っているので、そちらを「出品者タイトル」として使う。
+    seller_title = ""
+    for node in _iter_jsonld(html):
+        if isinstance(node, dict) and node.get("@type") == "BreadcrumbList":
+            names = [(i.get("name") or (i.get("item") or {}).get("name") or "") for i in node.get("itemListElement", [])]
+            if names and names[-1]:
+                seller_title = names[-1]
+    images = []
+    for node in _iter_jsonld(html):
+        if isinstance(node, dict) and node.get("@type") in ("Product", "ProductGroup"):
+            variants = node.get("hasVariant") if node.get("@type") == "ProductGroup" else [node]
+            for v in (variants or [])[:1]:
+                imgs = v.get("image") if isinstance(v, dict) else None
+                for u in (imgs if isinstance(imgs, list) else [imgs] if imgs else []):
+                    if isinstance(u, str) and u not in images:
+                        images.append(u)
+    info["images"] = images[:12] or ([info["image"]] if info.get("image") else [])
+    info["title"] = seller_title or info.get("name") or ""
+    info["description"] = desc
+    info["url"] = url
+    info["labeled_models"] = extract_labeled_models(info["title"], desc)
+    info["model_candidates"] = guess_model_candidates(info["title"], info.get("name") or "", desc)
+    info["title_en"] = to_english(info["title"])
+    # BUYMAのカテゴリー（パンくずの中ほど）も英語にして、検索ワードに使う
+    cats = []
+    for node in _iter_jsonld(html):
+        if isinstance(node, dict) and node.get("@type") == "BreadcrumbList":
+            names = [(i.get("name") or (i.get("item") or {}).get("name") or "") for i in node.get("itemListElement", [])]
+            if any(n.startswith(("メンズ", "レディース")) for n in names):
+                cats = [n for n in names[1:-1] if n]
+    info["category_en"] = to_english(" ".join(cats[-1:])) or category_en(info["title"])
+    return info
+
+
+def _abs_url(base: str, href: str) -> str:
+    return urljoin(base, href) if href else ""
+
+
+def _extract_contacts(html: str, base_url: str) -> dict:
+    soup = soupify(html)
+    phones, emails, pages = [], [], []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        low = href.lower()
+        text = a.get_text(" ", strip=True).lower()
+        if low.startswith("tel:"):
+            ph = re.sub(r"[^\d+]", "", href[4:])
+            if len(ph) >= 7 and ph not in phones:
+                phones.append(ph)
+        elif low.startswith("mailto:"):
+            em = href[7:].split("?")[0].strip()
+            if em and em not in emails:
+                emails.append(em)
+        elif any(w in low or w in text for w in _CONTACT_WORDS):
+            if low.startswith(("#", "javascript:")):
+                continue
+            u = _abs_url(base_url, href)
+            same = u.split("#")[0].rstrip("/") == base_url.split("#")[0].rstrip("/")
+            if u.startswith("http") and not same and u not in pages:
+                pages.append(u)
+    body = soup.get_text(" ", strip=True)
+    for m in re.finditer(r"(?:Tel|TEL|Phone|Call|電話|Telefon|Téléphone)[^\d+]{0,10}(\+?\d[\d\s().\-]{7,}\d)", body):
+        ph = re.sub(r"[^\d+]", "", m.group(1))
+        if len(ph) >= 7 and ph not in phones:
+            phones.append(ph)
+    for m in re.finditer(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", body):
+        em = m.group(0)
+        if em not in emails and not em.lower().endswith((".png", ".jpg", ".webp")):
+            emails.append(em)
+    return {"phones": phones[:3], "emails": emails[:3], "pages": pages[:3]}
+
+
+def _stock_from_shopify(url: str):
+    """ShopifyのサイトならURLの末尾に .js を付けると、サイズ別の在庫（在庫あり／なし）が取れる。"""
+    p = urlparse(url)
+    m = re.match(r"(.*?/products/[^/?#]+)", p.path)
+    if not m:
+        return None
+    try:
+        data = json.loads(fetch(f"{p.scheme}://{p.netloc}{m.group(1)}.js"))
+    except Exception:  # noqa: BLE001
+        return None
+    variants = data.get("variants") or []
+    if not variants:
+        return None
+    return [(str(v.get("title") or v.get("option1") or "?"), bool(v.get("available"))) for v in variants]
+
+
+def _stock_from_jsonld(html: str):
+    out = []
+    for node in _iter_jsonld(html):
+        if not isinstance(node, dict):
+            continue
+        variants = node.get("hasVariant") if node.get("@type") == "ProductGroup" else None
+        for v in variants or []:
+            if not isinstance(v, dict):
+                continue
+            label = v.get("size") or v.get("name") or v.get("sku") or "?"
+            offers = _find_offers(v)
+            if offers:
+                avail = str(offers[0].get("availability") or "")
+                out.append((str(label), avail.endswith(("InStock", "LimitedAvailability", "PreOrder"))))
+    return out or None
+
+
+# ---- VAT（付加価値税）：表示価格に税が含まれているか／含まれていない場合の想定額 ----
+_VAT_STATUSES = ["税込み", "税込み（推定）", "税抜き", "不明"]
+# 国ごとの標準的なVAT率の目安（ドメインの末尾から判断。商品によって軽減税率などで違うことがある）
+_VAT_RATE_BY_TLD = {
+    "it": 22, "fr": 20, "de": 19, "es": 21, "uk": 20, "nl": 21, "be": 21, "at": 20, "ie": 23, "pt": 23,
+    "se": 25, "dk": 25, "fi": 25.5, "pl": 23, "gr": 24, "ch": 8.1, "kr": 10, "au": 10, "cz": 21, "hu": 27,
+    "no": 25, "lu": 17, "mt": 18, "ee": 22, "lv": 21, "lt": 21, "sk": 23, "si": 22, "hr": 25, "bg": 20, "ro": 19,
+}
+_VAT_INCLUDED_RE = re.compile(
+    r"(iva\s*(?:inclusa|compresa|incl)|tasse\s*incluse|tax(?:es)?\s*included|incl\.?\s*(?:vat|tax)|inc\.?\s*vat|"
+    r"vat\s*included|inkl\.?\s*(?:mwst|ust)|tva\s*(?:incluse|comprise)|\bttc\b|iva\s*incluido|impuestos\s*incluidos|"
+    r"부가세\s*포함|세금\s*포함|税込|消費税込)", re.I)
+_VAT_EXCLUDED_RE = re.compile(
+    r"(excl\.?\s*(?:vat|tax)|vat\s*(?:excluded|not included)|tax(?:es)?\s*(?:excluded|not included)|"
+    r"zzgl\.?\s*(?:mwst|ust)|iva\s*esclusa|hors\s*taxes|plus\s*(?:sales\s*)?tax|"
+    r"taxes?\s*(?:and\s*shipping\s*)?calculated\s*at\s*checkout|税抜|税別)", re.I)
+
+
+def _vat_rate_for(url: str, currency: str):
+    host = urlparse(url).netloc.lower()
+    tld = host.rsplit(".", 1)[-1] if "." in host else ""
+    if host.endswith(".co.uk"):
+        tld = "uk"
+    if tld in _VAT_RATE_BY_TLD:
+        return _VAT_RATE_BY_TLD[tld]
+    if currency == "GBP":
+        return 20
+    return None  # .com・EURでも国が分からない場合などは、手入力してもらう
+
+
+def detect_vat(html: str, url: str, currency: str) -> dict:
+    """価格に税（VAT）が含まれているかを、ページの記載・構造化データ・国の傾向から判定する。"""
+    rate = _vat_rate_for(url, currency)
+    for node in _iter_jsonld(html):
+        flag = _find_key(node, "valueAddedTaxIncluded")
+        if flag is not None:
+            inc = str(flag).lower() in ("true", "1")
+            return {"VAT表示": "税込み" if inc else "税抜き", "VAT率": rate, "VAT根拠": "ページの構造化データに明記"}
+    body = soupify(html).get_text(" ", strip=True)
+    m = _VAT_INCLUDED_RE.search(body)
+    if m:
+        return {"VAT表示": "税込み", "VAT率": rate, "VAT根拠": f"ページに「{m.group(0)}」と記載"}
+    m = _VAT_EXCLUDED_RE.search(body)
+    if m:
+        return {"VAT表示": "税抜き", "VAT率": rate, "VAT根拠": f"ページに「{m.group(0)}」と記載"}
+    if rate:
+        return {"VAT表示": "税込み（推定）", "VAT率": rate, "VAT根拠": "記載なし。国の傾向（個人向けの価格は税込みが一般的）"}
+    return {"VAT表示": "不明", "VAT率": None, "VAT根拠": "記載なし。国も特定できませんでした"}
+
+
+def _find_key(node, key):
+    if isinstance(node, dict):
+        if key in node:
+            return node[key]
+        for v in node.values():
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(node, list):
+        for v in node:
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def _signed_yen(v: int) -> str:
+    return f"−¥{abs(v):,}" if v < 0 else f"¥{v:,}"
+
+
+def vat_free_yen(yen_value, status: str, rate):
+    """VATが含まれている（またはその可能性がある）価格から、VATを除いた想定の円額を返す。税抜きなら、そのまま。"""
+    try:
+        y = float(yen_value)
+    except (TypeError, ValueError):
+        return None
+    if y != y:  # 読み取れなかった行（空欄）はNaNになるので、計算しない
+        return None
+    try:
+        r = float(rate)
+    except (TypeError, ValueError):
+        r = 0.0
+    if status == "税抜き" or r <= 0:
+        return int(round(y))
+    return int(round(y / (1 + r / 100)))
+
+
+_BLOCK_MARKERS = (
+    "isBotPage", "Access Denied", "Just a moment", "cf-browser-verification", "captcha", "Attention Required",
+    "errors.edgesuite.net", "Pardon Our Interruption", "unusual traffic", "px-captcha",
+)
+
+
+def _looks_blocked(html: str) -> bool:
+    """ロボット（自動アクセス）を防ぐためのページが返ってきたかを判定する。"""
+    h = html or ""
+    has_product_data = "application/ld+json" in h and ('"Product"' in h or '"ProductGroup"' in h)
+    return (not has_product_data) and any(m.lower() in h.lower() for m in _BLOCK_MARKERS)
+
+
+# ---- 楽天市場・Yahoo!ショッピング（ツールから読める。ショップの会社概要ページも自動で取る）----
+def _clean_jp_title(title: str):
+    """「【楽天市場】商品名：ショップ名」「商品名 : ストア名 - 通販 - Yahoo!ショッピング」から、商品名とショップ名を分ける。"""
+    t = (title or "").strip()
+    shop = ""
+    m = re.match(r"^(.*?)\s*[:：]\s*([^:：]+?)\s*-\s*通販\s*-\s*Yahoo!ショッピング$", t)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    if t.startswith("【楽天市場】"):
+        t = t[len("【楽天市場】"):]
+        if "：" in t:
+            t, shop = t.rsplit("：", 1)
+    return t.strip(), shop.strip()
+
+
+def _jp_shop_lines(page_html: str) -> list:
+    """会社概要ページの文章から、ショップ情報の行（会社名・責任者・住所・電話・営業時間など）を作る。"""
+    raw_lines = soupify(page_html).get_text("\n", strip=True).split("\n")
+    kept, skip_next = [], False
+    for ln in raw_lines:  # FAX番号は連絡先に入れない（FAXの行と、その次の番号だけの行を除く）
+        if skip_next:
+            skip_next = False
+            if not re.search(r"[A-Za-z\u3040-\u30ff\u4e00-\u9fff]", ln):
+                continue
+        if re.search(r"FAX|Fax|ファックス|ファクス", ln):
+            skip_next = not re.search(r"\d{2,4}-\d{2,4}-\d{3,4}", ln)
+            continue
+        kept.append(ln)
+    text = "\n".join(kept)
+    got = parse_shop_info(text)
+    out = []
+    company = next((ln for ln in text.split("\n") if re.match(r"^(株式会社|有限会社|合同会社)\S{1,30}$", ln.strip())), "")
+    if company:
+        out.append(f"会社名：{company.strip()}")
+    for lab in ("ストア名", "販売業者", "運営会社", "運営責任者", "店舗運営責任者", "代表者"):
+        if lab in got["fields"]:
+            out.append(f"{lab}：{got['fields'][lab]}")
+    addr = next((ln.strip() for ln in text.split("\n") if ln.strip().startswith("〒") and len(ln.strip()) > 10), "")
+    if addr:
+        out.append(f"所在地：{addr}")
+    elif "住所" in got["fields"]:
+        out.append(f"所在地：{got['fields']['住所']}")
+    return out, got
+
+
+def enrich_marketplace(row: dict, html: str, url: str, light: bool) -> dict:
+    """楽天市場・Yahoo!ショッピングの商品ページなら、商品名・価格・在庫・ショップ情報を追加で読み取る。"""
+    p = urlparse(url)
+    host, parts = p.netloc.lower(), [x for x in p.path.split("/") if x]
+    shop_id, info_url, market = "", "", ""
+    if host == "item.rakuten.co.jp" and parts:
+        market, shop_id = "楽天市場", parts[0]
+        info_url = f"https://www.rakuten.co.jp/{shop_id}/info.html"
+    elif host == "store.shopping.yahoo.co.jp" and parts:
+        market, shop_id = "Yahoo!ショッピング", parts[0]
+        info_url = f"https://store.shopping.yahoo.co.jp/{shop_id}/info.html"
+    elif host == "paypaymall.yahoo.co.jp" and len(parts) >= 2 and parts[0] == "store":
+        market, shop_id = "Yahoo!ショッピング", parts[1]
+        info_url = f"https://store.shopping.yahoo.co.jp/{shop_id}/info.html"
+    if not market:
+        return row
+    row = dict(row)
+    title, shop_name = _clean_jp_title(row.get("仕入れ先商品名") or "")
+    if title:
+        row["仕入れ先商品名"] = title
+    # 価格（楽天はページ内のデータに入っている）
+    if not row.get("円換算"):
+        m = re.search(r'"minPrice":([\d.]+)', html) or re.search(r'"taxIncludedPrice":([\d.]+)', html)
+        if m:
+            row["現地価格"], row["通貨"], row["円換算"] = float(m.group(1)), "JPY", int(float(m.group(1)))
+    if row.get("通貨") == "JPY":
+        row["VAT表示"], row["VAT率"], row["VAT根拠"] = "税込み", 10, "日本のショップ（日本の価格表示は消費税込み）"
+    # 楽天：サイズ別の在庫
+    if market == "楽天市場":
+        if not shop_name:
+            m = re.search(r'"shopName":\s*"([^"]+)"', html)
+            shop_name = m.group(1) if m else ""
+        inv = re.search(r'"variantMappedInventories":(\[.*?\])', html)
+        if inv:
+            qty = {x["sku"]: x["quantity"] for x in json.loads(inv.group(1))}
+            labels = {}
+            for m in re.finditer(r'"variantId":"([^"]+)","selectorValues":(\[[^\]]*\])', html):
+                labels[m.group(1)] = " ".join(re.sub(r"（\d+）", "", v) for v in json.loads(m.group(2)))
+            if len(qty) == 1:
+                q = next(iter(qty.values()))
+                row["在庫（サイズ別）"] = f"この商品 {'✅' if q > 0 else '❌'}（{'残り%d点' % q if q > 0 else '売り切れ'}）"
+            else:
+                items, unknown_out, unknown_in = [], 0, 0
+                for sku, q in qty.items():
+                    if sku in labels:
+                        items.append(f"{labels[sku]} {'✅' if q > 0 else '❌'}" + (f"（残り{q}点）" if 0 < q < 10 else ""))
+                    elif q > 0:
+                        unknown_in += 1
+                    else:
+                        unknown_out += 1
+                if unknown_in:
+                    items.append(f"（サイズ不明の在庫あり {unknown_in}種）✅")
+                if unknown_out:
+                    items.append(f"その他 {unknown_out}種 ❌（売り切れ）")
+                row["在庫（サイズ別）"] = "、".join(items)
+    row["仕入れ先サイト"] = f"{market}｜{shop_name or shop_id}"
+    info = [f"モール：{market}", f"ショップ：{shop_name or shop_id}"]
+    if not light:
+        try:
+            lines, got = _jp_shop_lines(fetch(info_url))
+            info += lines
+            row["電話"] = row.get("電話") or " / ".join(got["phones"])
+            row["メール"] = row.get("メール") or " / ".join(got["emails"])
+        except Exception:  # noqa: BLE001
+            info.append("（ショップの会社概要ページは読み取れませんでした）")
+    row["ショップ情報"] = "\n".join(info)
+    return row
+
+
+def analyze_supplier(url: str, html: str = "", light: bool = False) -> dict:
+    """仕入れ先の商品ページから、価格・円換算・サイズ別在庫・連絡先を読み取る。"""
+    html = html or fetch(url)
+    if _looks_blocked(html):
+        raise PermissionError("blocked")
+    soup = soupify(html)
+    title = ""
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content"):
+        title = og["content"].strip()
+    elif soup.title and soup.title.string:
+        title = soup.title.string.strip()
+
+    amount, currency = (extract_price_generic(html) or (None, None))
+    price_note = ""
+    _offers = [o for n in _iter_jsonld(html) for o in _find_offers(n)]
+    _vals = []
+    for o in _offers:
+        try:
+            _vals.append((float(str(o["price"]).replace(",", "")), "InStock" in str(o.get("availability", ""))))
+        except (ValueError, TypeError, KeyError):
+            pass
+    if len({v for v, _ in _vals}) > 1 and currency:
+        _in = [v for v, ok in _vals if ok]
+        amount = min(_in) if _in else min(v for v, _ in _vals)  # 在庫のあるバリエーションの最安値を使う
+        price_note = f"【バリエーションで価格が違います：{min(v for v, _ in _vals):,.2f}〜{max(v for v, _ in _vals):,.2f} {currency}。在庫ありの最安値を使っています】"
+    yen_value = None
+    if amount and currency:
+        fx = fetch_fx_rate(currency) if currency != "JPY" else (1.0, None)
+        if fx:
+            yen_value = int(round(amount * fx[0]))
+
+    stock = _stock_from_shopify(url) or _stock_from_jsonld(html)
+    if stock:
+        stock_text = "、".join(f"{label} {'✅' if ok else '❌'}" for label, ok in stock)
+    else:
+        stock_text = "サイズ別の在庫は取得できず（サイトで確認）"
+    if price_note:
+        stock_text = price_note + "、" + stock_text
+
+    contacts = _extract_contacts(html, url)
+    if not light and not contacts["phones"] and not contacts["emails"]:
+        for page in contacts["pages"][:2]:
+            try:
+                more = _extract_contacts(fetch(page), page)
+            except Exception:  # noqa: BLE001
+                continue
+            contacts["phones"] = contacts["phones"] or more["phones"]
+            contacts["emails"] = contacts["emails"] or more["emails"]
+            if contacts["phones"] or contacts["emails"]:
+                break
+
+    vat = detect_vat(html, url, currency or "")
+    base = {
+        "仕入れ先サイト": urlparse(url).netloc.replace("www.", ""),
+        "仕入れ先商品名": title,
+        "現地価格": amount if amount else "",
+        "通貨": currency or "",
+        "円換算": yen_value if yen_value else "",
+        "VAT表示": vat["VAT表示"],
+        "VAT率": vat["VAT率"] if vat["VAT率"] is not None else "",
+        "VAT根拠": vat["VAT根拠"],
+        "在庫（サイズ別）": stock_text,
+        "電話": " / ".join(contacts["phones"]),
+        "メール": " / ".join(contacts["emails"]),
+        "問い合わせページ": contacts["pages"][0] if contacts["pages"] else "",
+        "仕入れ先URL": url,
+    }
+    return enrich_marketplace(base, html, url, light)
+
+
+# 交渉メールの例文（「{...}」の部分は自動で埋まる）。送る前に必ず内容を確認すること。
+_NEGOTIATION_TEMPLATES = {
+    "English": (
+        "Subject: Wholesale inquiry - {product}\n\nHello,\n\n"
+        "I am a professional buyer based in Japan and I am interested in purchasing the following item from your store.\n\n"
+        "Item: {product}\nURL: {url}\nSize / quantity: {qty}\n\n"
+        "Could you please let me know:\n"
+        "1. Do you have the above sizes in stock?\n"
+        "2. Do you offer a wholesale or discounted price for this quantity (and for repeat orders)?\n"
+        "3. Do you ship to Japan? If so, what are the shipping cost and delivery time?\n"
+        "4. Can you issue a tax-free (VAT-exempt) invoice for this export order?\n"
+        "5. Which payment methods do you accept?\n\n"
+        "Thank you very much. I look forward to your reply.\n\nBest regards,\n{sender}"
+    ),
+    "Italiano": (
+        "Oggetto: Richiesta di acquisto all'ingrosso - {product}\n\nBuongiorno,\n\n"
+        "sono un buyer professionista con sede in Giappone e sono interessato ad acquistare il seguente articolo dal vostro negozio.\n\n"
+        "Articolo: {product}\nURL: {url}\nTaglia / quantità: {qty}\n\n"
+        "Potreste gentilmente indicarmi:\n"
+        "1. Le taglie indicate sono disponibili?\n"
+        "2. Offrite un prezzo all'ingrosso o scontato per questa quantità (e per ordini ripetuti)?\n"
+        "3. Spedite in Giappone? In caso affermativo, quali sono i costi e i tempi di spedizione?\n"
+        "4. Potete emettere una fattura senza IVA per questo ordine destinato all'esportazione?\n"
+        "5. Quali metodi di pagamento accettate?\n\n"
+        "Grazie mille. Resto in attesa di una vostra risposta.\n\nCordiali saluti,\n{sender}"
+    ),
+    "Français": (
+        "Objet : Demande d'achat en gros - {product}\n\nBonjour,\n\n"
+        "Je suis un acheteur professionnel basé au Japon et je souhaiterais acheter l'article suivant dans votre boutique.\n\n"
+        "Article : {product}\nURL : {url}\nTaille / quantité : {qty}\n\n"
+        "Pourriez-vous m'indiquer :\n"
+        "1. Les tailles ci-dessus sont-elles disponibles en stock ?\n"
+        "2. Proposez-vous un tarif de gros ou une remise pour cette quantité (et pour des commandes régulières) ?\n"
+        "3. Expédiez-vous au Japon ? Si oui, quels sont les frais et les délais de livraison ?\n"
+        "4. Pouvez-vous établir une facture hors taxes (exonérée de TVA) pour cette commande à l'export ?\n"
+        "5. Quels modes de paiement acceptez-vous ?\n\n"
+        "Je vous remercie par avance et reste dans l'attente de votre réponse.\n\nCordialement,\n{sender}"
+    ),
+    "Deutsch": (
+        "Betreff: Anfrage zum Großhandelskauf - {product}\n\nGuten Tag,\n\n"
+        "ich bin ein professioneller Einkäufer mit Sitz in Japan und möchte den folgenden Artikel in Ihrem Shop kaufen.\n\n"
+        "Artikel: {product}\nURL: {url}\nGröße / Menge: {qty}\n\n"
+        "Könnten Sie mir bitte mitteilen:\n"
+        "1. Sind die oben genannten Größen auf Lager?\n"
+        "2. Bieten Sie für diese Menge (und für Folgebestellungen) einen Großhandels- oder Mengenrabatt an?\n"
+        "3. Versenden Sie nach Japan? Wenn ja, wie hoch sind die Versandkosten und die Lieferzeit?\n"
+        "4. Können Sie für diese Exportbestellung eine steuerfreie (mehrwertsteuerfreie) Rechnung ausstellen?\n"
+        "5. Welche Zahlungsarten akzeptieren Sie?\n\n"
+        "Vielen Dank. Ich freue mich auf Ihre Antwort.\n\nMit freundlichen Grüßen\n{sender}"
+    ),
+    "한국어": (
+        "제목: 도매 구매 문의 - {product}\n\n안녕하세요.\n\n"
+        "저는 일본에 거주하는 전문 바이어이며, 귀사의 아래 상품을 구매하고 싶어 연락드립니다.\n\n"
+        "상품명: {product}\nURL: {url}\n사이즈 / 수량: {qty}\n\n"
+        "아래 사항을 알려주시면 감사하겠습니다.\n"
+        "1. 위 사이즈의 재고가 있나요?\n"
+        "2. 해당 수량(및 재주문)에 대한 도매가 또는 할인가가 가능한가요?\n"
+        "3. 일본으로 배송이 가능한가요? 가능하다면 배송비와 배송 기간을 알려주세요.\n"
+        "4. 수출 주문에 대해 부가세 면세(영세율) 처리가 가능한가요?\n"
+        "5. 결제 방법은 어떤 것이 가능한가요?\n\n"
+        "감사합니다. 회신 기다리겠습니다.\n\n{sender} 드림"
+    ),
+}
+_NEGOTIATION_JA = (
+    "【日本語訳（確認用）】\n件名：卸売り・まとめ買いのお問い合わせ\n\n"
+    "日本在住のプロのバイヤーです。貴店の下記の商品を購入したいと考えています。\n\n"
+    "商品／URL／サイズ・数量は上記のとおりです。\n\n"
+    "次の点を教えてください。\n"
+    "1. 上記のサイズの在庫はありますか？\n"
+    "2. この数量（および継続注文）に対する卸売り価格・割引はありますか？\n"
+    "3. 日本へ発送できますか？送料と配送日数を教えてください。\n"
+    "4. この輸出注文に対して、免税（VATなし）のインボイスを発行できますか？\n"
+    "5. 利用できる支払い方法は何ですか？\n\n"
+    "よろしくお願いします。"
+)
+
+
+def _run_parallel(func, items, workers: int = 6) -> list:
+    """複数のURLを同時に読み取る（Streamlitのキャッシュを使えるよう、実行コンテキストを引き継ぐ）。"""
+    ctx = get_script_run_ctx()
+
+    def init():
+        if ctx is not None:
+            add_script_run_ctx(threading.current_thread(), ctx)
+
+    with ThreadPoolExecutor(max_workers=workers, initializer=init) as ex:
+        return list(ex.map(func, items))
+
+
+def analyze_supplier_safe(url: str, light: bool = True) -> dict:
+    try:
+        return analyze_supplier(url, light=light)
+    except Exception as e:  # noqa: BLE001
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if isinstance(e, PermissionError) or status in (401, 403, 429, 503):
+            note = "🚫 このサイトは自動アクセスを防いでいるため読み取れません（ブラウザで開いて価格を確認してください）"
+        else:
+            note = f"読み取りエラー：{str(e)[:50]}"
+        return {
+            "仕入れ先サイト": urlparse(url).netloc.replace("www.", ""), "仕入れ先商品名": "（自動では読み取れませんでした）",
+            "現地価格": "", "通貨": "", "円換算": "", "VAT表示": "不明", "VAT率": "", "VAT根拠": "", "在庫（サイズ別）": note,
+            "電話": "", "メール": "", "問い合わせページ": "", "仕入れ先URL": url,
+        }
+
+
+def search_shopify_store(shop_url: str, query: str, limit: int = 5):
+    """Shopify製のショップなら、サイト内検索の結果（商品ページURL）を取得する。対応していないショップはNone。"""
+    p = urlparse(shop_url if shop_url.startswith("http") else "https://" + shop_url)
+    if not p.netloc:
+        return None
+    root = f"{p.scheme}://{p.netloc}"
+    try:
+        r = requests.get(
+            root + "/search/suggest.json",
+            params={"q": query, "resources[type]": "product", "resources[limit]": limit},
+            headers=HEADERS, timeout=12,
+        )
+        prods = r.json()["resources"]["results"]["products"]
+    except Exception:  # noqa: BLE001
+        return None
+    return [root + pr["url"].split("?")[0] for pr in prods if pr.get("url")]
+
+
+def _sourcing_rows() -> list:
+    return st.session_state.setdefault("sourcing_list", [])
+
+
+def _add_sourcing_row(row: dict, item: dict) -> int:
+    """仕入れ先リストに1行追加（同じ仕入れ先URLがあれば、交渉済み・メモを引き継いで上書き）。件数を返す。"""
+    now = dt.datetime.now()
+    row = dict(row)
+    row.update({
+        "交渉済み": False,
+        "追加日時": f"{now.year}/{now.month}/{now.day}",
+        "BUYMA商品名": (item or {}).get("name") or "",
+        "BUYMA売価": (item or {}).get("price") or "",
+        "BUYMA商品URL": (item or {}).get("url") or "",
+        "メモ": "",
+    })
+    row["種類"] = row.get("種類") or _site_kind(row.get("仕入れ先URL") or "")
+    rows = _sourcing_rows()
+    for i, existing in enumerate(rows):
+        if existing.get("仕入れ先URL") == row["仕入れ先URL"]:
+            row["交渉済み"], row["メモ"] = existing.get("交渉済み", False), existing.get("メモ", "")
+            rows[i] = row
+            return len(rows)
+    rows.append(row)
+    return len(rows)
+
+
+def _set_sourcing_field(idx: int, field: str, widget_key: str):
+    """詳細パネルで直した値（VAT表示・VAT率）を、仕入れ先リストの該当行に書き戻す。"""
+    rows = st.session_state.get("sourcing_list") or []
+    if 0 <= idx < len(rows):
+        rows[idx][field] = st.session_state.get(widget_key)
+
+
+def import_sourcing_csv(uploaded) -> int:
+    df = pd.read_csv(uploaded, encoding="utf-8-sig").fillna("")
+    count = 0
+    rows = _sourcing_rows()
+    for rec in df.to_dict("records"):
+        if not rec.get("仕入れ先URL"):
+            continue
+        row = {c: rec.get(c, "") for c in SOURCING_COLUMNS}
+        row["種類"] = row["種類"] or "セレクトショップ等"
+        row["交渉済み"] = str(rec.get("交渉済み", "")).strip().lower() in ("true", "1", "はい", "✅", "済")
+        for i, existing in enumerate(rows):
+            if existing.get("仕入れ先URL") == row["仕入れ先URL"]:
+                rows[i] = row
+                break
+        else:
+            rows.append(row)
+        count += 1
+    return count
+
+
+# ---- ページの文字を貼って価格を探す／手入力で補う（自動で読めないサイト用）----
+_PRICE_SYMS = {"€": "EUR", "£": "GBP", "$": "USD", "₩": "KRW", "EUR": "EUR", "USD": "USD", "GBP": "GBP",
+               "KRW": "KRW", "CHF": "CHF", "円": "JPY", "원": "KRW"}
+_AMT_RE = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?"
+_SYM_RE = r"€|£|\$|₩|EUR|USD|GBP|KRW|CHF|円|원"
+_PRICE_PRE = re.compile(rf"({_SYM_RE})\s?({_AMT_RE})")
+_PRICE_POST = re.compile(rf"({_AMT_RE})\s?({_SYM_RE})")
+_CURRENCY_CHOICES = ["EUR", "USD", "GBP", "KRW", "JPY", "AUD", "CAD", "CHF", "CNY", "HKD"]
+
+
+def _parse_amount(s: str):
+    """「1.480,00」「1,480.00」「480,00」「480」などの書き方をまとめて数字にする。"""
+    if "," in s and "." in s:
+        dec = "," if s.rfind(",") > s.rfind(".") else "."
+    elif "," in s or "." in s:
+        sep = "," if "," in s else "."
+        parts = s.split(sep)
+        dec = sep if (len(parts) == 2 and len(parts[1]) != 3) else None
+    else:
+        dec = None
+    try:
+        if dec:
+            i = s.rfind(dec)
+            return float(f"{re.sub(r'[.,]', '', s[:i])}.{s[i + 1:]}")
+        return float(re.sub(r"[.,]", "", s))
+    except ValueError:
+        return None
+
+
+_YEN_PRE = re.compile(rf"[¥￥]\s?({_AMT_RE})")
+
+
+def find_prices_in_text(text: str, limit: int = 6, yen_is_jpy: bool = False) -> list:
+    """貼り付けたページの文章から、価格らしいもの（金額, 通貨）を、よく出てくる順に返す。"""
+    counts, order = Counter(), {}
+    if yen_is_jpy:  # 日本のショップのページ：「¥」は円
+        for m in _YEN_PRE.finditer(text or ""):
+            val = _parse_amount(m.group(1))
+            if val and val >= 100:
+                key = (round(val, 2), "JPY")
+                counts[key] += 1
+                order.setdefault(key, m.start())
+    for rx, swap in ((_PRICE_PRE, False), (_PRICE_POST, True)):
+        for m in rx.finditer(text or ""):
+            sym, amt = (m.group(2), m.group(1)) if swap else (m.group(1), m.group(2))
+            val = _parse_amount(amt)
+            cur = _PRICE_SYMS.get(sym)
+            if not val or val <= 0 or not cur:
+                continue
+            if cur not in ("JPY", "KRW") and val < 1:
+                continue
+            key = (round(val, 2), cur)
+            counts[key] += 1
+            order.setdefault(key, m.start())
+    ranked = sorted(counts, key=lambda k: (-counts[k], order[k]))
+    return ranked[:limit]
+
+
+def _title_from_url(url: str) -> str:
+    seg = [x for x in urlparse(url).path.split("/") if x]
+    return re.sub(r"[-_]+", " ", seg[-1]).strip().title() if seg else ""
+
+
+def fill_supplier_price(row: dict, amount: float, currency: str, page_text: str = "") -> dict:
+    """読み取れなかった行に、手で入れた（または貼ったページから見つけた）価格を入れて、円換算とVATを計算し直す。"""
+    row = dict(row)
+    fx = (1.0, None) if currency == "JPY" else fetch_fx_rate(currency)
+    row["現地価格"], row["通貨"] = amount, currency
+    row["_manual"] = True
+    row["円換算"] = int(round(amount * fx[0])) if fx else ""
+    vat = detect_vat(page_text or "", row.get("仕入れ先URL") or "", currency)
+    row["VAT表示"] = vat["VAT表示"]
+    row["VAT率"] = vat["VAT率"] if vat["VAT率"] is not None else ""
+    row["VAT根拠"] = vat["VAT根拠"]
+    if str(row.get("仕入れ先商品名") or "").startswith("（自動"):
+        row["仕入れ先商品名"] = _title_from_url(row.get("仕入れ先URL") or "") or "（商品名は手入力）"
+    stock = str(row.get("在庫（サイズ別）") or "")
+    if "✅" not in stock and "❌" not in stock:
+        row["在庫（サイズ別）"] = "サイズ別の在庫は、ページで確認してメモ欄へ"
+    return row
+
+
+# ---- 画像検索用：加工していない写真を選ぶ ----
+def _image_stats(url: str) -> dict:
+    """写真に「赤い文字」などの加工が入っていないか、白い背景の商品写真かを調べる。"""
+    try:
+        from io import BytesIO
+        from PIL import Image
+        small = re.sub(r"/org\.(jpg|jpeg|png|webp)$", r"/428.\1", url)
+        r = requests.get(small, headers=HEADERS, timeout=10)
+        if r.status_code != 200:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+        im = Image.open(BytesIO(r.content)).convert("RGB")
+        im.thumbnail((200, 200))
+        px = list(im.getdata())
+        n = max(len(px), 1)
+        red = sum(1 for (a, b, c) in px if a > 200 and b < 80 and c < 80) / n
+        w, h = im.size
+        border = [im.getpixel((x, y)) for x in range(w) for y in (0, 1, h - 2, h - 1)]
+        border += [im.getpixel((x, y)) for y in range(h) for x in (0, 1, w - 2, w - 1)]
+        white = sum(1 for (a, b, c) in border if min(a, b, c) > 238) / max(len(border), 1)
+        return {"url": url, "thumb": small, "red": red, "white": white}
+    except Exception:  # noqa: BLE001
+        return {"url": url, "thumb": url, "red": 0.0, "white": 0.0}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def score_item_images(urls: tuple) -> list:
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        stats = list(ex.map(_image_stats, urls))
+    med = statistics.median(x["red"] for x in stats) if stats else 0.0
+    for x in stats:
+        # 他の写真より、赤い部分が明らかに多い＝「サイズ有り」などの赤い文字が入った加工写真
+        x["edited"] = x["red"] > 0.0015 and x["red"] > 3 * med + 0.001
+    return stats
+
+
+def pick_clean_image(stats: list) -> int:
+    """加工なし＋白い背景の商品写真を優先して選ぶ。無ければ、加工なしの最初の写真。"""
+    for i, x in enumerate(stats):
+        if not x["edited"] and x["white"] >= 0.9:
+            return i
+    for i, x in enumerate(stats):
+        if not x["edited"]:
+            return i
+    return 0
+
+
+# ---- 公式サイト ----
+# ブランドの公式サイトのドメイン（Googleで「site:ドメイン」検索するのに使う。国ごとのページは、各国のGoogleで検索すると出てくる）
+_OFFICIAL_SITES = {
+    "MAX MARA": "maxmara.com", "WEEKEND MAX MARA": "maxmara.com", "S MAX MARA": "maxmara.com",
+    "LOUIS VUITTON": "louisvuitton.com", "SAINT LAURENT": "ysl.com", "BOTTEGA VENETA": "bottegaveneta.com",
+    "THE NORTH FACE": "thenorthface.com", "STONE ISLAND": "stoneisland.com", "CHRISTIAN DIOR": "dior.com",
+    "DIOR": "dior.com", "CHANEL": "chanel.com", "HERMES": "hermes.com", "GUCCI": "gucci.com",
+    "PRADA": "prada.com", "FENDI": "fendi.com", "CELINE": "celine.com", "BALENCIAGA": "balenciaga.com",
+    "BURBERRY": "burberry.com", "MIU MIU": "miumiu.com", "VALENTINO": "valentino.com", "GIVENCHY": "givenchy.com",
+    "GOYARD": "goyard.com", "MONCLER": "moncler.com", "LOEWE": "loewe.com", "COACH": "coach.com",
+    "TORY BURCH": "toryburch.com", "MICHAEL KORS": "michaelkors.com", "KATE SPADE": "katespade.com",
+    "MARC JACOBS": "marcjacobs.com", "ALEXANDER MCQUEEN": "alexandermcqueen.com", "OFF WHITE": "off---white.com",
+    "AMI PARIS": "amiparis.com", "JIL SANDER": "jilsander.com", "MACKAGE": "mackage.com", "STUSSY": "stussy.com",
+    "ADIDAS": "adidas.com", "NIKE": "nike.com", "NEW BALANCE": "newbalance.com", "UGG": "ugg.com",
+    "STEVE MADDEN": "stevemadden.com", "VERSACE": "versace.com", "GIORGIO ARMANI": "armani.com", "ARMANI": "armani.com",
+    "SALVATORE FERRAGAMO": "ferragamo.com", "FERRAGAMO": "ferragamo.com", "TODS": "tods.com",
+    "JIMMY CHOO": "jimmychoo.com", "MANOLO BLAHNIK": "manoloblahnik.com", "ROGER VIVIER": "rogervivier.com",
+    "CARTIER": "cartier.com", "TIFFANY": "tiffany.com", "BVLGARI": "bulgari.com", "MONTBLANC": "montblanc.com",
+    "MAISON MARGIELA": "maisonmargiela.com", "KENZO": "kenzo.com", "LANVIN": "lanvin.com",
+    "THOM BROWNE": "thombrowne.com", "VETEMENTS": "vetements.com", "BALMAIN": "balmain.com", "CHLOE": "chloe.com",
+    "MULBERRY": "mulberry.com", "LONGCHAMP": "longchamp.com", "FURLA": "furla.com", "PATAGONIA": "patagonia.com",
+    "CANADA GOOSE": "canadagoose.com", "BARBOUR": "barbour.com", "SUPREME": "supreme.com", "VANS": "vans.com",
+    "CONVERSE": "converse.com", "RALPH LAUREN": "ralphlauren.com", "ALO YOGA": "aloyoga.com",
+}
+
+
+def official_domain_for(brand: str) -> str:
+    """ブランド名（英語）から、公式サイトのドメインを探す。見つからなければ空文字。"""
+    key = re.sub(r"[^A-Z0-9 ]", "", re.sub(r"[&'’\-]", " ", (brand or "").upper()))
+    key = re.sub(r"\s+", " ", key).strip()
+    if key in _OFFICIAL_SITES:
+        return _OFFICIAL_SITES[key]
+    for name in sorted(_OFFICIAL_SITES, key=len, reverse=True):
+        if name in key:
+            return _OFFICIAL_SITES[name]
+    return ""
+
+
+def _clean_domain(text: str) -> str:
+    d = (text or "").strip().lower()
+    d = re.sub(r"^https?://", "", d).split("/")[0]
+    return re.sub(r"^www\.", "", d)
+
+
+def _site_kind(url: str, official: str = None) -> str:
+    dom = _clean_domain(official if official is not None else st.session_state.get("src_official_domain", ""))
+    host = urlparse(url).netloc.lower().replace("www.", "")
+    if dom and (host == dom or host.endswith("." + dom)):
+        return "公式サイト"
+    return "セレクトショップ等"
+
+
+# ---- ショップ情報（ZOZOTOWNなど、ツールから読めないページのコピーから拾う）----
+_SHOP_LABELS = [
+    "販売業者", "販売事業者", "運営会社", "運営事業者", "運営責任者", "事業者名", "会社名", "店舗名", "ショップ名", "屋号",
+    "代表者", "責任者", "所在地", "住所", "電話番号", "TEL", "Tel", "電話", "メールアドレス", "E-mail", "Email", "営業時間",
+    "ストア名", "お問い合わせ電話番号", "お問い合わせメールアドレス", "お問い合わせ", "問い合わせ先", "返品・交換", "返品", "交換", "支払い方法", "配送方法", "送料",
+]
+_JP_PHONE_RE = re.compile(r"(?<![\d-])(0\d{1,4}[-−ー‐－]\d{1,4}[-−ー‐－]\d{3,4})(?![\d-])")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+
+def parse_shop_info(text: str) -> dict:
+    """貼り付けたショップ情報のページから、電話・メール・会社名・所在地などを拾う。"""
+    text = (text or "").replace("\r", "")
+    phones = [re.sub(r"[−ー‐－]", "-", m) for m in _JP_PHONE_RE.findall(text)]
+    emails = [e for e in _EMAIL_RE.findall(text) if not e.lower().endswith((".png", ".jpg", ".webp"))]
+    lines = [ln.strip() for ln in text.split("\n")]
+    fields = {}
+    for i, ln in enumerate(lines):
+        for lab in sorted(_SHOP_LABELS, key=len, reverse=True):
+            if ln.startswith(lab):
+                rest = re.sub(r"^[\s:：\t]+", "", ln[len(lab):])
+                if not rest:  # 値が次の行にあるとき
+                    nxt = next((x for x in lines[i + 1:i + 4] if x), "")
+                    rest = nxt if not any(nxt.startswith(l2) for l2 in _SHOP_LABELS) else ""
+                if rest and lab not in fields and len(rest) <= 200:
+                    fields[lab] = rest
+                break
+    return {
+        "phones": list(dict.fromkeys(phones))[:3],
+        "emails": list(dict.fromkeys(emails))[:3],
+        "fields": fields,
+    }
+
+
+_NOT_COLOR_WORDS = ("完売", "カート", "店舗在庫", "サイズ相当", "入荷", "お気に入り", "詳細", "しました", "在庫", "残り")
+_STOCK_LINE_RE = re.compile(r"^(\S{1,12})\s*/\s*(在庫なし|在庫あり|残り\s*\d+\s*点|残りわずか|売り切れ|完売|SOLD OUT)")
+
+
+def parse_pasted_extras(text: str) -> dict:
+    """貼り付けたページ（ZOZOTOWNなど）から、サイズ別の在庫・商品名・ショップの情報を拾う。"""
+    lines = [ln.strip() for ln in (text or "").replace("\r", "").split("\n")]
+    ne = [(i, ln) for i, ln in enumerate(lines) if ln]
+    stock, color, info, title = [], "", [], ""
+    for k, (i, ln) in enumerate(ne):
+        m = _STOCK_LINE_RE.match(ln)
+        nxt = ne[k + 1][1] if k + 1 < len(ne) else ""
+        if m:
+            status = m.group(2)
+            ok = status not in ("在庫なし", "売り切れ", "完売", "SOLD OUT")
+            extra = f"（{re.sub(chr(32), '', status)}）" if ok and status != "在庫あり" else ""
+            label = f"{color} {m.group(1)}".strip()
+            stock.append(f"{label} {'✅' if ok else '❌'}{extra}")
+        elif (_STOCK_LINE_RE.match(nxt) and len(ln) <= 12 and not any(w in ln for w in _NOT_COLOR_WORDS)):
+            color = ln
+        elif ln == "お気に入りアイテム登録者数" and k > 0 and not title:
+            title = ne[k - 1][1]
+        elif ln == "発送元" and nxt:
+            info.append(f"発送元：{nxt}")
+        elif ln == "問い合わせ番号":
+            for _, v in ne[k + 1:k + 4]:
+                if re.search(r"[（(](ZOZO|店舗)[）)]", v):
+                    info.append(("ZOZOの番号：" if "ZOZO" in v else "店舗の品番：") + re.sub(r"[（(](ZOZO|店舗)[）)]", "", v))
+                else:
+                    break
+        elif ln == "取り扱いショップ" and nxt:
+            kana = ne[k + 2][1] if k + 2 < len(ne) else ""
+            info.append(f"ショップ：{nxt}" + (f"（{kana}）" if kana and not kana.startswith("ショップ") else ""))
+    if "店舗在庫確認・取り置き" in (text or ""):
+        info.append("店舗：実店舗の在庫を確認・取り置きできる商品です")
+    return {"stock": "、".join(stock), "info": info, "title": title}
+
+
+def _guess_currency(url: str) -> str:
+    """ショップのURLの国から、使っていそうな通貨を推測する（手入力のときの初期値）。"""
+    host = urlparse(url).netloc.lower()
+    tld = host.rsplit(".", 1)[-1]
+    if host.endswith(".co.uk") or tld == "uk":
+        return "GBP"
+    return {"jp": "JPY", "kr": "KRW", "au": "AUD", "ca": "CAD", "ch": "CHF", "cn": "CNY", "hk": "HKD",
+            "it": "EUR", "fr": "EUR", "de": "EUR", "es": "EUR", "nl": "EUR", "at": "EUR", "be": "EUR",
+            "pt": "EUR", "ie": "EUR", "fi": "EUR", "gr": "EUR"}.get(tld, "USD")
+
+
+def _is_japan_shop(row: dict) -> bool:
+    host = urlparse(str(row.get("仕入れ先URL") or "")).netloc.lower()
+    return str(row.get("通貨") or "") == "JPY" or host.endswith(".jp") or host.endswith("zozo.jp")
+
+
+# 国ごとの標準的なVAT（付加価値税）の税率の目安（%）。商品によって軽減税率があることもある。
+_VAT_COUNTRIES = {
+    "🇮🇹 イタリア": 22, "🇫🇷 フランス": 20, "🇩🇪 ドイツ": 19, "🇪🇸 スペイン": 21, "🇬🇧 イギリス": 20,
+    "🇳🇱 オランダ": 21, "🇧🇪 ベルギー": 21, "🇦🇹 オーストリア": 20, "🇵🇹 ポルトガル": 23, "🇮🇪 アイルランド": 23,
+    "🇬🇷 ギリシャ": 24, "🇸🇪 スウェーデン": 25, "🇩🇰 デンマーク": 25, "🇫🇮 フィンランド": 25.5, "🇨🇭 スイス": 8.1,
+    "🇰🇷 韓国": 10, "🇦🇺 オーストラリア": 10, "🇨🇦 カナダ（GST）": 5, "🇺🇸 アメリカ（VATなし）": 0, "🇯🇵 日本": 10,
+}
+_TLD_VAT_COUNTRY = {
+    "it": "🇮🇹 イタリア", "fr": "🇫🇷 フランス", "de": "🇩🇪 ドイツ", "es": "🇪🇸 スペイン", "uk": "🇬🇧 イギリス",
+    "nl": "🇳🇱 オランダ", "be": "🇧🇪 ベルギー", "at": "🇦🇹 オーストリア", "pt": "🇵🇹 ポルトガル", "ie": "🇮🇪 アイルランド",
+    "gr": "🇬🇷 ギリシャ", "se": "🇸🇪 スウェーデン", "dk": "🇩🇰 デンマーク", "fi": "🇫🇮 フィンランド", "ch": "🇨🇭 スイス",
+    "kr": "🇰🇷 韓国", "au": "🇦🇺 オーストラリア", "ca": "🇨🇦 カナダ（GST）", "jp": "🇯🇵 日本",
+}
+
+
+def _set_vat_country(idx: int, country_key: str, rate_key: str):
+    """国を選んだら、その国の税率をVAT率の欄と、リストの該当行に入れる。"""
+    name = st.session_state.get(country_key)
+    rate = _VAT_COUNTRIES.get(name)
+    rows = st.session_state.get("sourcing_list") or []
+    if rate is not None and 0 <= idx < len(rows):
+        rows[idx]["VAT率"] = rate
+        st.session_state[rate_key] = float(rate)
+
+
+def _has_yen(c: dict) -> bool:
+    try:
+        return float(c.get("円換算")) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+
+def _head(title: str, help_md: str = "", level: int = 2, label: str = "❓ 解説"):
+    """見出しの右側に「解説」ボタンを置く。押すと説明が出る（普段は説明を出さず、画面をすっきりさせる）。"""
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        (st.header if level == 2 else st.subheader)(title)
+    if help_md:
+        with c2:
+            st.write("")
+            with st.popover(label, use_container_width=True):
+                st.markdown(help_md)
+
+
+def render_sourcing_tool():
+    _head(
+        "🛒 仕入れ先リサーチ",
+        "**BUYMAで売れている商品の、海外の仕入れ先を探して、いくら安く仕入れられるかを比べるツールです。**\n\n"
+        "やることは3つだけです。\n\n1. BUYMAの商品ページのURLを貼る\n2. 海外のGoogleで探す\n3. 見つけたページを貼る\n\n"
+        "あとは、価格の比較・連絡先・交渉メールまで自動で出ます。\n\n"
+        "⚠️ このリストは、**ブラウザを閉じると消えます**。最後に必ず「CSVでダウンロード」で保存してください。",
+        label="❓ 使い方",
+    )
+    st.caption("① BUYMAの商品を貼る → ② 海外のGoogleで探す → ③ 見つけたページを貼る　（※ ブラウザを閉じるとリストは消えます。CSVで保存を）")
+
+    with st.expander("📂 前回の続きから作業する（保存したCSVを読み込む）", expanded=False):
+        up = st.file_uploader("前回ダウンロードした「buyma_仕入れ先リサーチ.csv」を選んでください", type="csv", key="src_upload")
+        if up is not None:
+            done = st.session_state.setdefault("src_imported_ids", [])
+            if up.file_id not in done:
+                try:
+                    n = import_sourcing_csv(up)
+                    done.append(up.file_id)
+                    st.success(f"{n}件を読み込みました。下の「STEP 5」に出ています。")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"CSVを読み込めませんでした（{e}）。ダウンロードしたCSVをそのまま選んでください。")
+
+    # ================= STEP 1
+    _head(
+        "STEP 1｜売れているBUYMAの商品を読み込む",
+        "ライバルが売っている（売れた）**BUYMAの商品ページのURL**を貼って「読み込む」を押します。\n\n"
+        "海外ショップのURLではありません。海外ショップのURLは、STEP 3に貼ります。",
+    )
+    c1, c2 = st.columns([4, 1])
+    with c1:
+        item_url = st.text_input(
+            "BUYMAの商品ページのURL", placeholder="https://www.buyma.com/item/12345678/", key="src_item_url",
+        )
+    with c2:
+        st.write("")
+        st.write("")
+        load_clicked = st.button("読み込む", key="src_load", use_container_width=True, type="primary")
+    if load_clicked and item_url.strip() and "buyma.com" not in item_url:
+        st.error(
+            "ここには **BUYMAの商品ページ**（https://www.buyma.com/item/数字/）のURLを貼ってください。"
+            "海外ショップの商品ページは、下の「STEP 3」に貼ります。"
+        )
+    elif load_clicked and item_url.strip():
+        try:
+            st.session_state["src_item"] = fetch_buyma_item_info(item_url.strip())
+            st.session_state.pop("src_models", None)
+            st.session_state.pop("src_qsel", None)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"商品ページを読み込めませんでした（{e}）。URLが「/item/数字/」の商品ページか確認してください。")
+    item = st.session_state.get("src_item")
+    if not item:
+        st.caption("↑ BUYMAの商品ページのURLを貼って「読み込む」を押してください。")
+    else:
+        ic1, ic2, ic3 = st.columns([1, 3, 2])
+        with ic1:
+            if item.get("image"):
+                st.image(item["image"], width=120)
+        with ic2:
+            st.markdown(f"**{item.get('title') or item.get('name') or '（商品名を取得できませんでした）'}**")
+            st.caption(f"ブランド：{item.get('brand') or '不明'}")
+        with ic3:
+            if item.get("price"):
+                st.metric("BUYMAでの売価", yen(item["price"]))
+            else:
+                p = st.number_input("BUYMAの売価（円）を入れてください", min_value=0, step=1000, key="src_price_manual")
+                if p > 0:
+                    item["price"] = int(p)
+
+        # ================= STEP 2
+        _head(
+            "STEP 2｜海外のGoogleで、仕入れ先を探す",
+            "1. 使う検索ワードを選びます（いちばん上がおすすめ）。\n"
+            "2. 国のボタンを押すと、その国のGoogleの検索結果が新しいタブで開きます。\n"
+            "3. 気になる商品ページを見つけたら、STEP 3に貼ります。\n\n"
+            "型番や国を変えたいときは、下の「検索ワードを自分で調整する」を開いてください。",
+        )
+        search_box = st.container()
+
+        brand = (item.get("brand") or "").strip()
+        brand_words = [w for w in re.split(r"[\s()（）]+", brand) if w and not _JP_CHARS_RE.fullmatch(w)]
+        brand_en = " ".join(brand_words) if brand_words else ""
+        title_en = item.get("title_en") or ""
+        cat_en = item.get("category_en") or ""
+        labeled = item.get("labeled_models") or []
+        guessed = [m for m in (item.get("model_candidates") or []) if m not in labeled]
+
+        with st.expander("🔧 検索ワードを自分で調整する（型番・国を変えたいとき）"):
+            e1, e2 = st.columns(2)
+            with e1:
+                st.markdown("**英語にしたタイトル**")
+                st.code(title_en or "（英語にできませんでした）", language=None)
+                st.caption(f"元のタイトル：{item.get('title') or item.get('name') or ''}")
+            with e2:
+                st.markdown("**ブランド・カテゴリー（英語）**")
+                st.code(f"{brand_en or '（ブランド不明）'} / {cat_en or '（カテゴリー不明）'}", language=None)
+                if labeled:
+                    st.success("🔖 商品ページに書かれていた型番：" + "、".join(labeled))
+                else:
+                    st.info("商品ページには、型番の記載が見つかりませんでした。")
+            picked = st.multiselect(
+                "検索に使う型番（ページに書かれていたものを最初から選んでいます）", labeled + guessed,
+                default=labeled[:2], key="src_models",
+                help="推測の候補は、本当の型番とは限りません。検索して当たりのものを使ってください。",
+            )
+            extra = st.text_input("その他の検索ワード（任意）", key="src_extra", placeholder="例：PR 17ZS sunglasses black")
+            countries = st.multiselect(
+                "検索する国のGoogle", list(_SEARCH_COUNTRIES.keys()),
+                default=["🇯🇵 日本", "🇺🇸 アメリカ", "🇬🇧 イギリス", "🇮🇹 イタリア", "🇰🇷 韓国"], key="src_countries",
+            )
+            use_shop = st.checkbox("ショッピング検索（価格が並ぶ画面）で開く", value=False, key="src_shop")
+
+        queries = {}
+        if brand_en and picked:
+            queries["ブランド＋型番＋カテゴリー"] = " ".join(x for x in [brand_en, " ".join(picked), cat_en] if x)
+        if title_en:
+            queries["英語のタイトル"] = title_en
+            nobrand = title_en
+            for w in sorted(brand_words, key=len, reverse=True):
+                nobrand = re.sub(re.escape(w), " ", nobrand, flags=re.I)
+            nobrand = re.sub(r"\s+", " ", nobrand).strip()
+            if nobrand and nobrand.lower() != title_en.lower() and len(nobrand) >= 4:
+                queries["英語のタイトル（ブランド名なし）"] = nobrand
+        for m in picked:
+            queries[f"型番のみ：{m}"] = m
+        if extra.strip():
+            queries["その他"] = extra.strip()
+        st.session_state["src_queries"] = queries
+
+        with search_box:
+            if countries and queries:
+                qlabels = list(queries.keys())
+                qsel = st.radio(
+                    "検索ワード", qlabels, format_func=lambda k: f"{k}：{queries[k]}", key="src_qsel",
+                    label_visibility="collapsed",
+                )
+                cols = st.columns(min(len(countries), 5))
+                for n, c in enumerate(countries):
+                    with cols[n % len(cols)]:
+                        st.link_button(
+                            f"{c} で探す", google_search_url(*_SEARCH_COUNTRIES[c][:3], queries[qsel], shopping=use_shop),
+                            use_container_width=True,
+                        )
+            else:
+                st.info("検索ワードを作れませんでした。「検索ワードを自分で調整する」を開いて、ワードを入力してください。")
+
+            imgs = item.get("images") or ([item["image"]] if item.get("image") else [])
+            if imgs:
+                _head(
+                    "🖼 写真でも探す（Google画像検索）",
+                    "BUYMAの出品者が文字（「サイズ有り」など）を入れた写真は、ほかのショップの写真と合わず見つかりにくいので、"
+                    "**加工していない白い背景の商品写真**を自動で選んでいます。別の写真に変えることもできます。\n\n"
+                    "※ 見分けられるのは赤い文字の加工です。",
+                    level=3,
+                )
+                import hashlib
+                stats = score_item_images(tuple(imgs[:9]))
+                rec = pick_clean_image(stats)
+                itag = hashlib.md5((item.get("url") or imgs[0]).encode()).hexdigest()[:6]
+                pick = st.radio(
+                    "探すのに使う写真", list(range(len(stats))), index=rec, horizontal=True, key=f"src_img_{itag}",
+                    format_func=lambda i: f"写真{i + 1}" + ("（おすすめ）" if i == rec else "（文字入り）" if stats[i]["edited"] else ""),
+                )
+                tcols = st.columns(min(len(stats), 5))
+                for i, x in enumerate(stats):
+                    with tcols[i % len(tcols)]:
+                        st.image(x["thumb"], caption=f"写真{i + 1}" + (" ⚠️文字入り" if x["edited"] else " ⭐おすすめ" if i == rec else ""), width=110)
+                st.link_button(f"🖼 写真{pick + 1}でGoogle画像検索（Lens）", img_search_url(stats[pick]["url"]))
+
+            _head(
+                "🏷 公式サイトに、まだ商品があるか確認する",
+                "国のボタンを押すと、その国のGoogleで**公式サイトの中だけ**を検索します。\n\n"
+                "- 商品ページが出てくれば、まだ公式にあります。\n"
+                "- 出てこない・「販売終了」「在庫なし」と出る場合は、もう無い可能性があります。\n"
+                "- 見つけた商品ページのURLは、STEP 3に貼ってください。「公式サイト」の印が付いて、セレクトショップと価格を比べられます。\n\n"
+                "公式サイトのドメインが空のときは、ブランド名で検索します。分かったら入れてください。",
+                level=3,
+            )
+            dom_default = official_domain_for(brand_en)
+            q_default = (picked[0] if picked else (queries.get("英語のタイトル（ブランド名なし）") or queries.get("英語のタイトル") or ""))
+            import hashlib
+            tag = hashlib.md5(f"{brand_en}|{q_default}".encode()).hexdigest()[:6]
+            o1, o2 = st.columns([2, 3])
+            with o1:
+                official_domain = st.text_input(
+                    "公式サイトのドメイン", value=dom_default, key=f"src_off_dom_{tag}", placeholder="例）maxmara.com",
+                    help="ブランドの公式サイトのアドレス（https://www. のあとの部分）です。主なブランドは自動で入ります。",
+                )
+            with o2:
+                official_q = st.text_input(
+                    "公式サイトで探すワード", value=q_default, key=f"src_off_q_{tag}",
+                    help="型番が分かれば、型番がいちばん確実です。",
+                )
+            st.session_state["src_official_domain"] = _clean_domain(official_domain)
+            off_countries = st.multiselect(
+                "どの国の公式サイトで確認する？", list(_SEARCH_COUNTRIES.keys()),
+                default=["🇮🇹 イタリア", "🇯🇵 日本"], key="src_off_countries",
+            )
+            dom = _clean_domain(official_domain)
+            if off_countries and official_q.strip():
+                ocols = st.columns(min(len(off_countries), 4))
+                for n, c in enumerate(off_countries):
+                    qq = f"site:{dom} {official_q.strip()}" if dom else f"{brand_en} official site {official_q.strip()}"
+                    with ocols[n % len(ocols)]:
+                        st.link_button(f"{c} の公式サイト", google_search_url(*_SEARCH_COUNTRIES[c][:3], qq), use_container_width=True)
+
+    # ================= STEP 3
+    _head(
+        "STEP 3｜見つけたページを貼って、価格を読み取る",
+        "Googleの検索結果で見つけた**商品ページのURL**を、1つずつ貼って「＋ 追加」を押します（Enterでも追加できます）。\n\n"
+        "追加したリンクが下に並びます。間違えたら「✕」で消せます。全部入れたら「価格を読み取る」を押します。\n\n"
+        "たくさんあるときは、下の「Googleの検索結果を、まるごと貼って…」に、検索結果ページの文章をまるごと貼ると、"
+        "商品ページのURLを自動で取り出して追加します（トップページ・YouTube・SNS・BUYMAなどは除きます）。",
+    )
+    item_now = st.session_state.get("src_item") or {}
+    pending = st.session_state.setdefault("src_pending_urls", [])
+
+    def _add_pending(text: str) -> int:
+        text = (text or "").strip()
+        if not text:
+            return 0
+        if re.fullmatch(r"https?://\S+", text):
+            found = [text]  # 1つだけ貼ったURLは、そのまま使う
+        else:
+            found = extract_urls_from_text(text)
+        n = 0
+        for u in found:
+            if u not in pending and len(pending) < 40:
+                pending.append(u)
+                n += 1
+        if found and not n:
+            return -1  # すでに追加済み（または40件まで）
+        return n
+
+    with st.form("src_url_form", clear_on_submit=True):
+        f1, f2 = st.columns([6, 1])
+        with f1:
+            one_url = st.text_input("商品ページのURLを、1つずつ貼る", placeholder="https://（見つけた商品ページのURL）")
+        with f2:
+            st.write("")
+            st.write("")
+            add_one = st.form_submit_button("＋ 追加", use_container_width=True)
+    if add_one:
+        res = _add_pending(one_url)
+        if res > 0:
+            st.rerun()
+        elif res < 0:
+            st.info("そのリンクは、すでに下の一覧に入っています（40件までです）。")
+        else:
+            st.warning("URLが見つかりませんでした。「https://」から始まるURLを貼ってください。")
+
+    if pending:
+        st.markdown(f"**追加したリンク（{len(pending)}件）**")
+        for i, u in enumerate(list(pending)):
+            l1, l2 = st.columns([12, 1])
+            with l1:
+                st.markdown(f"{i + 1}. [{u[:90] + '…' if len(u) > 90 else u}]({u})")
+            with l2:
+                if st.button("✕", key=f"src_pend_del_{i}_{abs(hash(u)) % 10**6}", help="このリンクを消す"):
+                    pending.remove(u)
+                    st.rerun()
+        if st.button(f"価格を読み取る（{len(pending)}件）", key="src_bulk_go", type="primary"):
+            urls = list(pending)
+            with st.spinner(f"{len(urls)}件の商品ページを読み取り中…"):
+                prev = st.session_state.get("src_candidates") or []
+                new_rows = _run_parallel(analyze_supplier_safe, urls)
+                merged = {r["仕入れ先URL"]: r for r in prev}
+                merged.update({r["仕入れ先URL"]: r for r in new_rows})
+                st.session_state["src_candidates"] = list(merged.values())
+            st.session_state["src_pending_urls"] = []
+            st.session_state["src_read_msg"] = f"{len(urls)}件のページを読み取りました。下の「STEP 4」を見てください。"
+            st.rerun()
+    if st.session_state.get("src_read_msg"):
+        st.success(st.session_state.pop("src_read_msg"))
+
+    with st.expander("📋 Googleの検索結果を、まるごと貼って一度に追加する"):
+        bulk_text = st.text_area("検索結果の文章（command+A → command+C でコピーしたもの）", height=120, key="src_bulk", placeholder="ここに貼り付け")
+        if st.button("検索結果からリンクを取り出して追加", key="src_bulk_add"):
+            res = _add_pending(bulk_text)
+            if res > 0:
+                st.rerun()
+            elif res < 0:
+                st.info("見つかったリンクは、すでに一覧に入っています。")
+            else:
+                st.warning("商品ページのURLが見つかりませんでした。検索結果のページを全選択してコピーしたものを貼ってください。")
+
+    with st.expander("🔧 上級：ショップのトップページから、商品を自動で探す（Shopify製のショップのみ）"):
+        shops_text = st.text_area("ショップのURL（1行に1つ）", height=80, key="src_shops",
+                                  placeholder="https://www.aloyoga.com\nhttps://www.kith.com")
+        if st.button("ショップ内を検索して候補を集める", key="src_shop_go"):
+            shops = [x.strip() for x in shops_text.splitlines() if x.strip()]
+            allq = st.session_state.get("src_queries") or {}
+            order = ["商品名（ブランド名なし）", "商品名（英数字のみ）"]
+            qs = [allq[k] for k in order if k in allq] + [q for k, q in allq.items() if k.startswith(("ブランド＋型番", "型番のみ"))]
+            qs = list(dict.fromkeys(qs))[:4]
+            if not shops or not qs:
+                st.warning("ショップのURLと、STEP 2の検索ワードが必要です（BUYMAの商品を読み込むと自動で作られます）。")
+            else:
+                with st.spinner("各ショップの中を検索しています…"):
+                    urls, unsupported = [], []
+                    for shop in shops:
+                        found_any = False
+                        for q in qs:
+                            hits = search_shopify_store(shop, q)
+                            if hits is None:
+                                break
+                            found_any = True
+                            urls.extend(hits)
+                        if not found_any:
+                            unsupported.append(shop)
+                    urls = list(dict.fromkeys(urls))[:40]
+                    rows = _run_parallel(analyze_supplier_safe, urls) if urls else []
+                prev = st.session_state.get("src_candidates") or []
+                merged = {r["仕入れ先URL"]: r for r in prev}
+                merged.update({r["仕入れ先URL"]: r for r in rows})
+                st.session_state["src_candidates"] = list(merged.values())
+                if unsupported:
+                    st.warning("自動検索に対応していないショップ：" + "、".join(unsupported) + "（商品ページのURLを上の欄に貼ってください）")
+                if not urls:
+                    st.info("検索ワードに当てはまる商品が見つかりませんでした。検索ワードを変えて試してください。")
+
+    # ================= STEP 4
+    cands = st.session_state.get("src_candidates") or []
+    if cands:
+        _head(
+            "STEP 4｜価格を比べる",
+            "**BUYMAの売価 − 仕入れ値 ＝ 差額** を、仕入れ先ごとに出します。\n\n"
+            "- この差額から、BUYMA手数料・国際送料・関税・国内送料を引いたものが、実際の利益です。\n"
+            "- 「海外の消費税」は、表示価格にVATが含まれているかです。日本向けに免税になれば、その分安くなります"
+            "（免税になるかは、ショップに確認が必要です）。\n"
+            "- 🏷公式＝ブランドの公式サイト、セレクト＝セレクトショップなどです。\n\n"
+            "**自動で価格を読めなかった行**は、表の「✏️ 価格を手入力」をダブルクリックして、ページで見た価格を入れます（Enterで反映）。"
+            "**先に右の「通貨」が合っているか確認してください**（イタリアならEUR、アメリカならUSDなど）。",
+        )
+        _render_candidates(cands, item_now)
+
+    rows = _sourcing_rows()
+    if not rows:
+        if not cands:
+            st.caption("まだ仕入れ先がありません。STEP 3で、見つけたページを貼ってください。")
+        return
+    _render_sourcing_list_and_detail(rows)
+
+
+def _render_candidates(cands: list, item_now: dict):
+    import hashlib
+
+    yens = sorted(int(float(c["円換算"])) for c in cands if _has_yen(c))
+    buyma_price = int(item_now.get("price") or 0)
+    bad = [c for c in cands if not _has_yen(c)]
+
+    if st.session_state.get("src_fix_msg"):
+        st.success(st.session_state.pop("src_fix_msg"))
+
+    if yens:
+        if buyma_price:
+            gap = buyma_price - yens[0]
+            msg = (
+                f"### BUYMAの売価 {yen(buyma_price)} − 一番安い仕入れ先 {yen(yens[0])} ＝ **{_signed_yen(gap)}**\n\n"
+                f"売価の約 {gap / buyma_price * 100:.0f}% の差があります。"
+                if gap > 0 else
+                f"### BUYMAの売価 {yen(buyma_price)} − 一番安い仕入れ先 {yen(yens[0])} ＝ **{_signed_yen(gap)}**\n\n"
+                "仕入れ値のほうが高く、このままでは赤字です。"
+            )
+            vf_all = [v for v in (vat_free_yen(c.get("円換算"), c.get("VAT表示"), c.get("VAT率")) for c in cands if _has_yen(c)) if v]
+            if vf_all and min(vf_all) < yens[0]:
+                msg += f"\n\n💡 VATが免税なら、最安 {yen(min(vf_all))} → 差額 {_signed_yen(buyma_price - min(vf_all))}"
+            (st.success if gap > 0 else st.error)(msg)
+        else:
+            st.info("上のSTEP 1でBUYMAの商品を読み込むと、「BUYMAの売価との差」がここに出ます。")
+
+    off_dom = st.session_state.get("src_official_domain", "")
+    if off_dom:
+        off_y = [int(float(c["円換算"])) for c in cands if _has_yen(c) and _site_kind(c["仕入れ先URL"]) == "公式サイト"]
+        sel_y = [int(float(c["円換算"])) for c in cands if _has_yen(c) and _site_kind(c["仕入れ先URL"]) != "公式サイト"]
+        if off_y and sel_y:
+            o, sm = min(off_y), min(sel_y)
+            diff = o - sm
+            word = f"セレクトショップのほうが **{yen(abs(diff))}（{abs(diff) / o * 100:.0f}%）安い**" if diff > 0 else (
+                f"公式サイトのほうが **{yen(abs(diff))}（{abs(diff) / sm * 100:.0f}%）安い**" if diff < 0 else "同じ価格")
+            st.info(f"🏷 **公式サイト {yen(o)}**　と　**セレクトショップ最安 {yen(sm)}**　を比べると、{word}です。")
+        elif off_y:
+            st.info(f"🏷 公式サイトの価格：{yen(min(off_y))}。セレクトショップの価格を、STEP 3で貼ると比べられます。")
+        elif any(_site_kind(c["仕入れ先URL"]) == "公式サイト" for c in cands):
+            st.warning("🏷 公式サイトのページは見つかりましたが、価格を読めていません。下の「手伝ってください」で価格を入れてください。")
+        else:
+            st.caption("🏷 公式サイトの価格は、まだありません。")
+
+    if bad:
+        with st.expander(f"⚠️ 価格を読めなかったページ {len(bad)}件（手伝ってください）", expanded=True):
+            h1, h2 = st.columns([5, 1])
+            with h1:
+                st.caption("ツールからは読めませんでした。ページを開いて、AかBのどちらかで入れてください。")
+            with h2:
+                with st.popover("❓ やり方", use_container_width=True):
+                    st.markdown(
+                        "サイトがロボットのアクセスを断っているため、ツールからは読めません。でも、**あなたのブラウザでは開けます**。\n\n"
+                        "1. 「🔗 ページを開く」で、そのページを開く\n"
+                        "2. **A**：ページを全選択（command+A）→ コピー（command+C）→ 「A」の欄に貼る\n"
+                        "3. **B**：ページで価格を見て、「B」の欄に自分で入れる\n"
+                        "4. 「反映する」を押す → 日本円・VAT・価格差を計算します\n\n"
+                        "表の「✏️ 価格を手入力」に直接入れてもOKです。"
+                    )
+            for c in bad:
+                url = c["仕入れ先URL"]
+                key = hashlib.md5(url.encode()).hexdigest()[:8]
+                st.markdown(f"**{c.get('仕入れ先サイト')}**　`{url[:70]}…`" if len(url) > 70 else f"**{c.get('仕入れ先サイト')}**　`{url}`")
+                st.link_button("🔗 ページを開く", url)
+                with st.form(f"src_fix_{key}"):
+                    f1, f2, f3 = st.columns([3, 2, 1])
+                    with f1:
+                        ptxt = st.text_area("A：ページの文字を貼る", height=80, key=f"src_fix_text_{key}")
+                    with f2:
+                        pamt = st.number_input("B：価格（現地の金額）", min_value=0.0, step=1.0, key=f"src_fix_amt_{key}")
+                    with f3:
+                        pcur = st.selectbox("通貨", _CURRENCY_CHOICES, key=f"src_fix_cur_{key}")
+                    if st.form_submit_button("反映する"):
+                        amount, cur, note = None, pcur, ""
+                        if pamt > 0:
+                            amount = float(pamt)
+                        elif ptxt.strip():
+                            found = find_prices_in_text(ptxt, yen_is_jpy=_guess_currency(url) == "JPY" or "ZOZOTOWN" in ptxt)
+                            if found:
+                                amount, cur = found[0]
+                                note = "（貼ったページから見つけた価格：" + "、".join(f"{a:,.2f} {cu}" for a, cu in found[:4]) + "。違う場合は、Bに入れ直してください）"
+                        if amount:
+                            new = fill_supplier_price(c, amount, cur, ptxt)
+                            ex = parse_pasted_extras(ptxt)
+                            if ex["stock"]:
+                                new["在庫（サイズ別）"] = ex["stock"]
+                            if ex["info"]:
+                                new["ショップ情報"] = "\n".join(ex["info"])
+                            if ex["title"]:
+                                new["仕入れ先商品名"] = ex["title"]
+                            st.session_state["src_candidates"] = [new if x["仕入れ先URL"] == url else x for x in st.session_state["src_candidates"]]
+                            st.session_state["src_fix_msg"] = f"{c.get('仕入れ先サイト')}：{amount:,.2f} {cur} で反映しました。{note}"
+                            st.rerun()
+                        else:
+                            st.warning("価格を見つけられませんでした。Bに価格を入れてください。")
+
+    show_all = st.checkbox("くわしい列（VAT抜きの金額・在庫）も表示する", value=False, key="src_cand_all")
+    cdf = pd.DataFrame(cands)
+    cdf["_y"] = pd.to_numeric(cdf["円換算"], errors="coerce")
+    cdf = cdf.sort_values("_y", na_position="last").drop(columns="_y").reset_index(drop=True)
+    cdf.insert(0, "追加", False)
+    cdf["円換算"] = pd.to_numeric(cdf["円換算"], errors="coerce")
+    cdf["現地の価格"] = [
+        f"{float(r['現地価格']):,.0f} {r['通貨']}" if str(r.get("現地価格") or "").strip() not in ("", "nan") else "（読めず）"
+        for r in cdf.to_dict("records")
+    ]
+    cdf["VAT抜き円換算"] = pd.to_numeric(
+        [vat_free_yen(r.get("円換算"), r.get("VAT表示"), r.get("VAT率")) for r in cdf.to_dict("records")], errors="coerce"
+    )
+    cdf["種類"] = [("🏷 公式" if _site_kind(u) == "公式サイト" else "セレクト") for u in cdf["仕入れ先URL"]]
+    cdf["VAT表示"] = [
+        "🇺🇸 VATなし（抜けません）" if str(c) == "USD" else v for v, c in zip(cdf["VAT表示"], cdf["通貨"])
+    ]  # アメリカのサイト（ドル表示）は、VATがないので抜けない（表示だけの変更。保存データは変えない）
+    cdf["手入力の価格"] = float("nan")
+    cdf["手入力の通貨"] = [_guess_currency(u) for u in cdf["仕入れ先URL"]]
+    show_cols = ["追加", "種類", "仕入れ先サイト", "仕入れ先商品名", "現地の価格", "手入力の価格", "手入力の通貨", "円換算"]
+    if buyma_price:
+        cdf["BUYMA売価"] = buyma_price
+        cdf["売価−仕入れの差額"] = buyma_price - cdf["円換算"]
+        cdf["差額の割合"] = (cdf["売価−仕入れの差額"] / buyma_price * 100).round(1)
+        cdf["VAT抜きの場合の差額"] = buyma_price - cdf["VAT抜き円換算"]
+        show_cols += ["BUYMA売価", "売価−仕入れの差額", "差額の割合"]
+    show_cols += ["VAT表示"]
+    if show_all:
+        show_cols += ["VAT抜き円換算"] + (["VAT抜きの場合の差額"] if buyma_price else []) + ["在庫（サイズ別）"]
+    show_cols += ["仕入れ先URL"]
+    ver = st.session_state.get("src_cand_ver", 0)
+    picked_df = st.data_editor(
+        cdf[show_cols], use_container_width=True, hide_index=True, key=f"src_cand_editor_{ver}",
+        disabled=[c for c in show_cols if c not in ("追加", "手入力の価格", "手入力の通貨")],
+        column_config={
+            "追加": st.column_config.CheckboxColumn("追加", help="気になる仕入れ先にチェック → 下のボタンで、STEP 5のリストに入ります"),
+            "手入力の価格": st.column_config.NumberColumn(
+                "✏️ 価格を手入力", min_value=0.0, format="%.2f",
+                help="自動で読めなかったときは、ここに商品ページで見た価格（現地の金額）を入れてください。入れると、日本円・差額を計算します。",
+            ),
+            "手入力の通貨": st.column_config.SelectboxColumn("通貨", options=_CURRENCY_CHOICES, help="手入力した価格の通貨（国から推測しています）"),
+            "種類": st.column_config.TextColumn("種類", help="🏷公式＝ブランドの公式サイト／セレクト＝セレクトショップなど"),
+            "仕入れ先サイト": st.column_config.TextColumn("ショップ"),
+            "仕入れ先商品名": st.column_config.TextColumn("商品名"),
+            "円換算": st.column_config.NumberColumn("日本円で", format="yen", help="為替レートで日本円にした金額（目安）"),
+            "BUYMA売価": st.column_config.NumberColumn("ライバルの売価（BUYMA）", format="yen", help="BUYMAで売れている商品の販売価格"),
+            "売価−仕入れの差額": st.column_config.NumberColumn("差額（売価−仕入れ）", format="yen", help="BUYMAの売価 − 仕入れ値。手数料・送料・関税は含みません"),
+            "差額の割合": st.column_config.NumberColumn("差額の割合", format="%.1f%%", help="差額 ÷ BUYMAの売価"),
+            "VAT表示": st.column_config.TextColumn("海外の消費税", help="表示価格に海外の消費税（VAT）が含まれているか。「推定」は国の傾向からの推測です"),
+            "VAT抜き円換算": st.column_config.NumberColumn("VAT抜きで", format="yen", help="VATが免税になった場合の目安（会計時に必ず確認）"),
+            "VAT抜きの場合の差額": st.column_config.NumberColumn("VAT抜きの差額", format="yen", help="BUYMAの売価 − VAT抜きの仕入れ額"),
+            "仕入れ先URL": st.column_config.LinkColumn("商品ページ", display_text="🔗 開く"),
+        },
+    )
+    typed = picked_df[picked_df["手入力の価格"].fillna(0) > 0]
+    if len(typed):
+        by_u = {c["仕入れ先URL"]: c for c in st.session_state["src_candidates"]}
+        for _, tr in typed.iterrows():
+            base = by_u.get(tr["仕入れ先URL"])
+            if base:
+                by_u[tr["仕入れ先URL"]] = fill_supplier_price(base, float(tr["手入力の価格"]), tr["手入力の通貨"] or _guess_currency(tr["仕入れ先URL"]))
+        st.session_state["src_candidates"] = list(by_u.values())
+        st.session_state["src_cand_ver"] = ver + 1
+        st.session_state["src_fix_msg"] = f"{len(typed)}件の価格を反映しました。"
+        st.rerun()
+    st.caption("✏️ 読めなかった行は、「価格を手入力」をダブルクリックして入力（先に「通貨」を確認）")
+    chosen = picked_df[picked_df["追加"]]["仕入れ先URL"].tolist()
+    b1, b2 = st.columns([3, 1])
+    with b1:
+        if st.button(f"✅ チェックした {len(chosen)} 件を、STEP 5のリストに追加（連絡先も調べます）", key="src_cand_add", disabled=not chosen, type="primary"):
+            with st.spinner("連絡先・在庫を調べています…"):
+                by_url = {c["仕入れ先URL"]: c for c in cands}
+                full = _run_parallel(
+                    lambda u: by_url[u] if (by_url[u].get("_manual") or not _has_yen(by_url[u])) else analyze_supplier_safe(u, light=False),
+                    chosen,
+                )
+            n = 0
+            for row in full:
+                row = {k: v for k, v in row.items() if k != "_manual"}
+                n = _add_sourcing_row(row, item_now)
+            st.success(f"追加しました（現在 {n} 件）。下の「STEP 5」を見てください。")
+    with b2:
+        if st.button("候補を全部消す", key="src_cand_clear", use_container_width=True):
+            st.session_state["src_candidates"] = []
+            st.rerun()
+
+
+def _render_sourcing_list_and_detail(rows: list):
+    import hashlib
+    # ================= STEP 5
+    _head(
+        "STEP 5｜保存した仕入れ先リスト",
+        "交渉・問い合わせをしたら「交渉済み」にチェックします。\n\n"
+        "メモ（改行できます）とリンクは、下の **STEP 6** で書けます。\n\n"
+        "最後に「CSVでダウンロード」で保存してください（ブラウザを閉じるとリストは消えます）。",
+    )
+    df = pd.DataFrame(rows).reindex(columns=SOURCING_COLUMNS)
+    df["交渉済み"] = df["交渉済み"].fillna(False).astype(bool)
+    for _c in ("追加日時", "BUYMA商品名", "仕入れ先サイト", "種類", "仕入れ先商品名", "通貨", "VAT表示", "VAT根拠", "在庫（サイズ別）",
+               "電話", "メール", "問い合わせページ", "仕入れ先URL", "BUYMA商品URL", "メモ", "リンク集", "ショップ情報"):
+        df[_c] = df[_c].fillna("").astype(str).replace("nan", "")
+    _b = pd.to_numeric(df["BUYMA売価"], errors="coerce")
+    _y = pd.to_numeric(df["円換算"], errors="coerce")
+    df.insert(df.columns.get_loc("円換算") + 1, "売価−仕入れの差額", _b - _y)
+    df.insert(df.columns.get_loc("売価−仕入れの差額") + 1, "差額の割合", ((_b - _y) / _b * 100).round(1))
+    _vf = pd.Series([vat_free_yen(r.get("円換算"), r.get("VAT表示"), r.get("VAT率")) for r in df.to_dict("records")], index=df.index)
+    _vf = pd.to_numeric(_vf, errors="coerce")
+    df.insert(df.columns.get_loc("差額の割合") + 1, "VAT抜き円換算", _vf)
+    df.insert(df.columns.get_loc("VAT抜き円換算") + 1, "VAT抜きの場合の差額", _b - _vf)
+    show_all = st.checkbox("すべての列を表示する（くわしく見たいとき）", value=False, key="src_list_all")
+    simple = ["交渉済み", "種類", "仕入れ先サイト", "仕入れ先商品名", "円換算", "BUYMA売価", "売価−仕入れの差額", "差額の割合", "VAT表示", "仕入れ先URL", "メモ"]
+    edited = st.data_editor(
+        df, use_container_width=True, hide_index=True, key="src_editor",
+        column_order=None if show_all else simple,
+        disabled=[c for c in df.columns if c != "交渉済み"],
+        column_config={
+            "交渉済み": st.column_config.CheckboxColumn("交渉済み", help="交渉・問い合わせをしたらチェック"),
+            "種類": st.column_config.TextColumn("種類"),
+            "仕入れ先サイト": st.column_config.TextColumn("ショップ"),
+            "仕入れ先商品名": st.column_config.TextColumn("商品名"),
+            "BUYMA売価": st.column_config.NumberColumn("ライバルの売価（BUYMA）", format="yen"),
+            "円換算": st.column_config.NumberColumn("日本円で", format="yen"),
+            "売価−仕入れの差額": st.column_config.NumberColumn("差額（売価−仕入れ）", format="yen", help="BUYMAの売価 − 仕入れ値（日本円）。手数料・送料・関税は含みません"),
+            "差額の割合": st.column_config.NumberColumn("差額の割合", format="%.1f%%"),
+            "VAT表示": st.column_config.TextColumn("海外の消費税"),
+            "VAT抜き円換算": st.column_config.NumberColumn("VAT抜きで", format="yen", help="VATを除いた場合の想定の仕入れ額（目安）"),
+            "VAT抜きの場合の差額": st.column_config.NumberColumn("VAT抜きの差額", format="yen", help="BUYMAの売価 − VAT抜きの仕入れ額"),
+            "問い合わせページ": st.column_config.LinkColumn("問い合わせページ", display_text="🔗 開く"),
+            "仕入れ先URL": st.column_config.LinkColumn("商品ページ", display_text="🔗 開く"),
+            "BUYMA商品URL": st.column_config.LinkColumn("BUYMA商品URL", display_text="🔗 開く"),
+            "メモ": st.column_config.TextColumn("メモ", help="メモは STEP 6 で書けます（改行もできます）"),
+        },
+    )
+    st.session_state["sourcing_list"] = edited[SOURCING_COLUMNS].to_dict("records")
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        csv = edited[SOURCING_COLUMNS].to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 CSVでダウンロード（保存・スプレッドシート用）", data=csv,
+            file_name="buyma_仕入れ先リサーチ.csv", mime="text/csv", use_container_width=True, type="primary",
+        )
+    with cc2:
+        if st.button("🗑 リストを空にする", key="src_clear", use_container_width=True):
+            st.session_state["sourcing_list"] = []
+            st.rerun()
+
+    # ================= STEP 6
+    _head(
+        "STEP 6｜選んだ仕入れ先に連絡する",
+        "仕入れ先を選ぶと、在庫・連絡先・メモ・リンク・交渉メールの例文が出ます。\n\n"
+        "メモは改行できます。リンクは1つずつ追加できます（公式サイト、別のショップ、在庫確認ページなど）。",
+    )
+    labels = [f"{r.get('仕入れ先サイト') or '?'}｜{(r.get('仕入れ先商品名') or '')[:30]}" for r in edited.to_dict("records")]
+    idx = st.selectbox("どの仕入れ先に連絡しますか？", range(len(labels)), format_func=lambda i: labels[i], key="src_pick")
+    r = edited.to_dict("records")[idx]
+
+    d1, d2 = st.columns(2)
+    with d1:
+        st.markdown("**在庫（サイズ別）**")
+        stock = str(r.get("在庫（サイズ別）") or "")
+        if "✅" in stock or "❌" in stock:
+            for part in stock.split("、"):
+                st.markdown(f"- {part}")
+        else:
+            st.caption(stock or "取得できず")
+        if r.get("現地価格") not in ("", None):
+            st.markdown(f"**価格**：{r.get('現地価格')} {r.get('通貨')}（約{yen(r['円換算']) if r.get('円換算') not in ('', None) else '円換算できず'}）")
+    with d2:
+        st.markdown("**連絡先**")
+        for ph in [p for p in str(r.get("電話") or "").split(" / ") if p]:
+            st.markdown(f"- 📞 [{ph}](tel:{ph})")
+        for em in [e for e in str(r.get("メール") or "").split(" / ") if e]:
+            st.markdown(f"- ✉️ [{em}](mailto:{em})")
+        if r.get("問い合わせページ"):
+            st.link_button("💬 問い合わせページを開く", r["問い合わせページ"])
+        if not (r.get("電話") or r.get("メール") or r.get("問い合わせページ")):
+            st.caption("連絡先を自動では見つけられませんでした。")
+        shop_info = str(r.get("ショップ情報") or "")
+        shop_name = ""
+        for ln in shop_info.split("\n"):
+            if ln.startswith("ショップ："):
+                shop_name = re.split(r"[（(]", ln[len("ショップ："):])[0].strip()
+        if shop_info or shop_name:
+            st.markdown("**🏬 ショップ情報**")
+            for ln in shop_info.split("\n"):
+                if ln.strip():
+                    st.markdown(f"- {ln}")
+        _u = str(r.get("仕入れ先URL") or "")
+        _zm = re.search(r"zozo\.jp/shop/([^/]+)/", _u)
+        if _zm:  # ZOZOTOWNは、ショップ名がURLに入っている（例：/shop/soph/）
+            st.link_button("🏬 ZOZOTOWNの「ショップ紹介」ページを開く", f"https://zozo.jp/shop/{_zm.group(1)}/detail/", use_container_width=True)
+        _site = str(r.get("仕入れ先サイト") or "")
+        _default_name = shop_name or (_zm.group(1).upper() if _zm else _site)
+        _ctag = hashlib.md5(_u.encode()).hexdigest()[:8]
+        sq = st.text_input(
+            "ショップ名（検索に使います。違うときは直してください）", value=_default_name, key=f"src_shopname_{_ctag}",
+        ).strip()
+        if sq:
+            q1, q2 = st.columns(2)
+            with q1:
+                st.link_button(f"🔍 「{sq[:14]}」の店舗を調べる", f"https://www.google.co.jp/search?q={quote_plus(sq + ' 店舗 実店舗')}", use_container_width=True)
+            with q2:
+                st.link_button(f"🔍 「{sq[:14]}」の公式サイト", f"https://www.google.co.jp/search?q={quote_plus(sq + ' 公式サイト')}", use_container_width=True)
+        with st.expander("📋 ショップ情報のページの文字を貼って、連絡先を読み取る"):
+            st.caption("ZOZOTOWNなど、ツールから読めないサイトで使います。")
+            si_key = f"src_shopinfo_{hashlib.md5(str(r.get('仕入れ先URL') or idx).encode()).hexdigest()[:8]}"
+            with st.popover("❓ やり方"):
+                st.markdown(
+                    "1. ブラウザで、そのショップの**「ショップ情報」「特定商取引法に基づく表記」「会社概要」**などのページを開く\n"
+                    "2. **command+A** で全選択 → **command+C** でコピー\n"
+                    "3. 下の欄に貼って「読み取る」を押す\n\n"
+                    "電話・メール・会社名・所在地などを、自動で拾います。"
+                )
+            info_text = st.text_area("ショップ情報のページの文字", height=120, key=si_key + "_t")
+            if st.button("読み取る", key=si_key + "_b"):
+                got = parse_shop_info(info_text)
+                if not (got["phones"] or got["emails"] or got["fields"]) and info_text.strip():
+                    st.session_state["sourcing_list"][idx]["ショップ情報"] = "紹介：" + re.sub(r"\s+", " ", info_text.strip())[:200]
+                    st.rerun()
+                elif not (got["phones"] or got["emails"] or got["fields"]):
+                    st.warning("貼り付ける文字がありません。ページを全選択してコピーしたものを貼ってください。")
+                else:
+                    row = st.session_state["sourcing_list"][idx]
+                    old_p = [x for x in str(row.get("電話") or "").split(" / ") if x]
+                    old_m = [x for x in str(row.get("メール") or "").split(" / ") if x]
+                    row["電話"] = " / ".join(dict.fromkeys(old_p + got["phones"]))
+                    row["メール"] = " / ".join(dict.fromkeys(old_m + got["emails"]))
+                    row["ショップ情報"] = "\n".join(f"{k}：{v}" for k, v in got["fields"].items())
+                    st.rerun()
+
+    tag = hashlib.md5(str(r.get("仕入れ先URL") or idx).encode()).hexdigest()[:8]
+    st.markdown("**📝 メモ**")
+    memo_key = f"src_memo_{tag}"
+    st.text_area(
+        "メモ（Enterで改行できます。書いたら、欄の外をクリックで保存）", value=str(r.get("メモ") or ""), height=150, key=memo_key,
+        on_change=_set_sourcing_field, args=(idx, "メモ", memo_key),
+        placeholder="例）\nサイズM 在庫あり\n送料 ¥3,000\n返信待ち 10/8",
+    )
+    st.markdown("**🔗 リンク**")
+    links = [ln for ln in str(r.get("リンク集") or "").split("\n") if ln.strip()]
+    for i, ln in enumerate(links):
+        name, _, u = ln.partition("｜") if "｜" in ln else ("", "", ln)
+        l1, l2 = st.columns([9, 1])
+        with l1:
+            st.markdown(f"- [{name or u}]({u})")
+        with l2:
+            if st.button("✕", key=f"src_linkdel_{tag}_{i}", help="このリンクを消す"):
+                new_links = [x for j, x in enumerate(links) if j != i]
+                st.session_state["sourcing_list"][idx]["リンク集"] = "\n".join(new_links)
+                st.rerun()
+    with st.form(f"src_linkform_{tag}", clear_on_submit=True):
+        f1, f2 = st.columns([2, 5])
+        with f1:
+            lname = st.text_input("名前（任意）", placeholder="例）公式サイト")
+        with f2:
+            lurl = st.text_input("リンクを1つ入れる", placeholder="https://")
+        if st.form_submit_button("＋ リンクを追加"):
+            if lurl.strip():
+                entry = f"{lname.strip()}｜{lurl.strip()}" if lname.strip() else lurl.strip()
+                st.session_state["sourcing_list"][idx]["リンク集"] = "\n".join(links + [entry])
+                st.rerun()
+
+    is_jp = _is_japan_shop(r)
+    if is_jp:
+        st.info(
+            "🇯🇵 日本のショップです。海外向けの交渉メールや、海外の消費税（VAT）の確認は、ふつう要りません。"
+            "上の電話・メール・問い合わせページで、在庫や価格を確認してください。"
+        )
+        if not st.checkbox("海外向けの交渉メールの例文も表示する", value=False, key="src_show_mail"):
+            return
+    else:
+        vf = vat_free_yen(r.get("円換算"), r.get("VAT表示"), r.get("VAT率"))
+        with st.expander("💶 海外の消費税（VAT）はどうなる？", expanded=vf is not None):
+            with st.popover("❓ 解説"):
+                st.markdown(
+                    "海外のショップは、日本へ送るとき**海外の消費税（VAT）を免税にしてくれることがあります**。免税になれば、その分、仕入れが安くなります。\n\n"
+                    "ここに出る「VAT抜き」の金額は、**会計時にVATが免税になる場合の目安**です。実際に免税になるかは、"
+                    "ショップのレジで日本の住所を入れるか、下のメールで確認してください。VAT率は国の標準税率の目安で、商品によって違うことがあります。"
+                )
+            _opts = ["（国を選ぶ）"] + list(_VAT_COUNTRIES)
+            _tld = urlparse(str(r.get("仕入れ先URL") or "")).netloc.lower().rsplit(".", 1)[-1]
+            _guess = _TLD_VAT_COUNTRY.get(_tld) or {
+                "USD": "🇺🇸 アメリカ（VATなし）", "GBP": "🇬🇧 イギリス", "KRW": "🇰🇷 韓国", "AUD": "🇦🇺 オーストラリア", "CAD": "🇨🇦 カナダ（GST）",
+            }.get(str(r.get("通貨") or ""))
+            if st.session_state.get(f"src_vat_country_{tag}", _guess) == "🇺🇸 アメリカ（VATなし）":
+                st.error(
+                    "### 🇺🇸 アメリカのサイトは、VATを抜けません\n\n"
+                    "アメリカには、ヨーロッパのようなVAT（付加価値税）がありません。**表示価格が、そのまま仕入れ額**です（送料・関税は別）。"
+                )
+            v0, v1, v2 = st.columns(3)
+            with v0:
+                st.selectbox(
+                    "ショップの国", _opts, index=_opts.index(_guess) if _guess in _opts else 0, key=f"src_vat_country_{tag}",
+                    on_change=_set_vat_country, args=(idx, f"src_vat_country_{tag}", f"src_vat_rate_{tag}"),
+                    help="国を選ぶと、その国の標準的なVAT率が「VAT率」に自動で入ります。",
+                )
+            with v1:
+                cur_status = r.get("VAT表示") if r.get("VAT表示") in _VAT_STATUSES else "不明"
+                st.selectbox(
+                    "表示価格の税", _VAT_STATUSES, index=_VAT_STATUSES.index(cur_status), key=f"src_vat_status_{tag}",
+                    on_change=_set_sourcing_field, args=(idx, "VAT表示", f"src_vat_status_{tag}"),
+                    help="ページの記載から自動判定しています。実際と違う場合は、ここで直してください。",
+                )
+            with v2:
+                try:
+                    cur_rate = float(r.get("VAT率")) if r.get("VAT率") not in ("", None) else 0.0
+                except (TypeError, ValueError):
+                    cur_rate = 0.0
+                st.number_input(
+                    "VAT率（%）", min_value=0.0, max_value=40.0, value=cur_rate, step=0.5, key=f"src_vat_rate_{tag}",
+                    on_change=_set_sourcing_field, args=(idx, "VAT率", f"src_vat_rate_{tag}"),
+                    help="国の標準的な税率の目安を入れています。分かる場合は直してください。",
+                )
+            try:
+                _d, _rt = int(float(r["円換算"])), float(r.get("VAT率") or 0)
+            except (TypeError, ValueError):
+                _d, _rt = None, 0.0
+            if _d is not None:
+                if r.get("VAT表示") == "税抜き":
+                    _inc, _exc = int(round(_d * (1 + _rt / 100))), _d
+                else:
+                    _inc, _exc = _d, int(round(_d / (1 + _rt / 100))) if _rt > 0 else _d
+                _bp = int(r["BUYMA売価"]) if r.get("BUYMA売価") not in ("", None) else None
+                k1, k2 = st.columns(2)
+                with k1:
+                    st.metric(f"VAT込みの仕入れ額（VAT{_rt:g}%を払う場合）", yen(_inc))
+                    if _bp:
+                        st.caption(f"差額（売価−仕入れ）：{_signed_yen(_bp - _inc)}")
+                with k2:
+                    st.metric("VAT抜きの仕入れ額（免税になる場合）", yen(_exc))
+                    if _bp:
+                        st.caption(f"差額（売価−仕入れ）：{_signed_yen(_bp - _exc)}")
+                st.caption(f"お店の表示価格 {yen(_d)} は「{r.get('VAT表示') or '不明'}」の金額です。国を選ぶと、VAT率が変わって、上の金額が変わります。")
+            st.caption(f"判定の根拠：{r.get('VAT根拠') or '（なし）'}")
+
+
+    m1, m2 = st.columns([5, 1])
+    with m1:
+        st.markdown("**✉️ 交渉メールの例文**")
+    with m2:
+        with st.popover("❓ 解説", use_container_width=True):
+            st.markdown(
+                "文章の右上のコピーボタンでコピーできます。\n\n"
+                "例文は自動で作った文章です。送る前に、内容（特に免税インボイスや支払い方法の条件）を確認してください。"
+            )
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        lang = st.selectbox("言語", list(_NEGOTIATION_TEMPLATES.keys()), key="src_lang")
+    with t2:
+        qty = st.text_input("希望サイズ・数量", value="例）S x1, M x2", key="src_qty")
+    with t3:
+        sender = st.text_input("あなたの名前・屋号", key="src_sender", placeholder="例）Naoko / ○○ Store")
+    product_name = (r.get("仕入れ先商品名") or r.get("BUYMA商品名") or "").strip()
+    body = _NEGOTIATION_TEMPLATES[lang].format(
+        product=product_name, url=r.get("仕入れ先URL") or "", qty=qty, sender=sender or "（名前）",
+    )
+    st.code(body, language=None)
+    with st.expander("日本語訳で内容を確認する"):
+        st.text(_NEGOTIATION_JA)
+
+
 # ============================ エントリーポイント ============================
 def main():
-    tab1, tab2, tab3 = st.tabs([
-        "🔎 出品者チェック", "💰 商品ごとの価格チェック", "📒 ブランド候補リスト",
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔎 出品者チェック", "💰 商品ごとの価格チェック", "🛒 仕入れ先リサーチ", "📒 ブランド候補リスト",
     ])
     with tab1:
         render_seller_tool()
     with tab2:
         render_price_tool()
     with tab3:
+        render_sourcing_tool()
+    with tab4:
         render_watchlist_tool()
 
 
